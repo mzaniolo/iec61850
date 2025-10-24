@@ -1,0 +1,144 @@
+ASN1 DEFINITIONS ::=
+BEGIN
+
+
+CP-type ::= SET {
+  mode-selector           [0] IMPLICIT Mode-selector,
+  normal-mode-parameters
+    [2] IMPLICIT SEQUENCE {protocol-version
+                             [0] IMPLICIT Protocol-version DEFAULT {version-1},
+                           calling-presentation-selector
+                             [1] IMPLICIT Calling-presentation-selector
+                               OPTIONAL,
+                           called-presentation-selector
+                             [2] IMPLICIT Called-presentation-selector OPTIONAL,
+                           presentation-context-definition-list
+                             [4] IMPLICIT Presentation-context-definition-list
+                               OPTIONAL,
+                           default-context-name
+                             [6] IMPLICIT Default-context-name OPTIONAL,
+                           presentation-requirements
+                             [8] IMPLICIT Presentation-requirements OPTIONAL,
+                           user-session-requirements
+                             [9] IMPLICIT User-session-requirements OPTIONAL-- shall not be present if equal to the Revised session
+                           -- requirements parameter --,
+                           user-data
+                             User-data OPTIONAL} OPTIONAL
+  -- Shall be used for normal mode only.
+  -- Shall be the parameters of the CP PPDU.
+}
+
+CPA-PPDU ::= SET {
+  mode-selector           [0] IMPLICIT Mode-selector,
+  normal-mode-parameters
+    [2] IMPLICIT SEQUENCE {protocol-version
+                             [0] IMPLICIT Protocol-version DEFAULT {version-1},
+                           responding-presentation-selector
+                             [3] IMPLICIT Responding-presentation-selector
+                               OPTIONAL,
+                           presentation-context-definition-result-list
+                             [5] IMPLICIT Presentation-context-definition-result-list
+                               OPTIONAL,
+                           presentation-requirements
+                             [8] IMPLICIT Presentation-requirements OPTIONAL,
+                           user-session-requirements
+                             [9] IMPLICIT User-session-requirements OPTIONAL,
+                           --  shall not be present if equal to the Revised session
+                           --  requirements parameter
+                           user-data
+                             User-data OPTIONAL} OPTIONAL
+  --  Shall be used for normal mode only.
+}
+
+Responding-presentation-selector ::= Presentation-selector
+Presentation-context-definition-result-list ::= Result-list
+
+Result-list ::=
+--  SEQUENCE SIZE (0..7, ..., 8..MAX) OF
+  SEQUENCE  OF
+    SEQUENCE {result                [0] IMPLICIT Result,
+              transfer-syntax-name  [1] IMPLICIT Transfer-syntax-name OPTIONAL,
+              provider-reason
+                [2] IMPLICIT INTEGER {reason-not-specified(0),
+                                      abstract-syntax-not-supported(1),
+                                      proposed-transfer-syntaxes-not-supported(2),
+                                      local-limit-on-DCS-exceeded(3)} OPTIONAL
+    }
+
+Result ::= INTEGER {acceptance(0), user-rejection(1), provider-rejection(2)}
+
+Mode-selector ::= SET {
+  mode-value  [0] IMPLICIT INTEGER {x410-1984-mode(0), normal-mode(1)}
+}
+
+
+User-data ::= CHOICE {
+  simply-encoded-data  [APPLICATION 0] IMPLICIT Simply-encoded-data,
+  fully-encoded-data   [APPLICATION 1] IMPLICIT Fully-encoded-data,
+  ...
+}
+
+--  Subclause 8.4 defines when each of the two alternatives shall be used.
+Simply-encoded-data ::= OCTET STRING
+--  See 8.4.1.
+--Fully-encoded-data ::= SEQUENCE SIZE (1, ..., 2..MAX) OF PDV-list
+Fully-encoded-data ::= SEQUENCE OF PDV-list
+
+--  contains one or more PDV-list values.
+--  See 8.4.2.
+PDV-list ::= SEQUENCE {
+  transfer-syntax-name             Transfer-syntax-name OPTIONAL,
+  presentation-context-identifier  Presentation-context-identifier,
+  presentation-data-values
+    CHOICE {single-ASN1-type	[0] ANY,
+                        --  Type corresponding to presentation context identifier
+            octet-aligned     [1] IMPLICIT OCTET STRING,
+            arbitrary         [2] IMPLICIT BIT STRING}
+  --  Contains one or more presentation data values from the same
+  --  presentation context.
+  --  See 8.4.2.
+}
+
+
+Presentation-context-definition-list ::= Context-list
+
+Context-list ::=
+--  SEQUENCE SIZE (0..7, ..., 8..MAX) OF
+  SEQUENCE  OF
+    SEQUENCE {presentation-context-identifier  Presentation-context-identifier,
+              abstract-syntax-name             Abstract-syntax-name,
+              transfer-syntax-name-list        SEQUENCE OF Transfer-syntax-name
+    }
+
+Default-context-name ::= SEQUENCE {
+  abstract-syntax-name  [0] IMPLICIT Abstract-syntax-name,
+  transfer-syntax-name  [1] IMPLICIT Transfer-syntax-name
+}
+
+--Presentation-context-identifier ::= INTEGER(1..127, ..., 128..MAX)
+Presentation-context-identifier ::= INTEGER
+Abstract-syntax-name ::= OBJECT IDENTIFIER
+Transfer-syntax-name ::= OBJECT IDENTIFIER
+Protocol-version ::= BIT STRING {version-1(0)}
+Called-presentation-selector ::= Presentation-selector
+Calling-presentation-selector ::= Presentation-selector
+--Presentation-selector ::= OCTET STRING(SIZE (1..4, ..., 5..MAX))
+Presentation-selector ::= OCTET STRING
+
+
+Default-context-name ::= SEQUENCE {
+  abstract-syntax-name  [0] IMPLICIT Abstract-syntax-name,
+  transfer-syntax-name  [1] IMPLICIT Transfer-syntax-name
+}
+
+Presentation-requirements ::= BIT STRING {context-management(0), restoration(1)
+}
+
+
+User-session-requirements ::= BIT STRING {
+  half-duplex(0), duplex(1), expedited-data(2), minor-synchronize(3),
+  major-synchronize(4), resynchronize(5), activity-management(6),
+  negotiated-release(7), capability-data(8), exceptions(9), typed-data(10),
+  symmetric-synchronize(11), data-separation(12)}
+
+END

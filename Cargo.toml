@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-asn1-rs = "0.7.1"
+rasn = "0.28.0"
 tokio = { version = "1.47.0", features = [
     "macros",
     "rt-multi-thread",
@@ -19,3 +19,7 @@ tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 snafu = "0.8.6"
 serde = { version = "1.0.219", features = ["derive"] }
+lazy_static = "1.5.0"
+
+[build-dependencies]
+rasn = { version = "0.28.0", features = ["compiler"] }

@@ -1,0 +1,355 @@
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    unused,
+    clippy::too_many_arguments
+)]
+pub mod asn1 {
+    extern crate alloc;
+    use core::borrow::Borrow;
+    use lazy_static::lazy_static;
+    use rasn::prelude::*;
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Abstract-syntax-name")]
+    pub struct AbstractSyntaxName(pub ObjectIdentifier);
+    #[doc = " Inner type "]
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(tag(context, 2))]
+    pub struct CPTypeNormalModeParameters {
+        #[rasn(
+            tag(context, 0),
+            default = "cptype_normal_mode_parameters_protocol_version_default",
+            identifier = "protocol-version"
+        )]
+        pub protocol_version: ProtocolVersion,
+        #[rasn(tag(context, 1), identifier = "calling-presentation-selector")]
+        pub calling_presentation_selector: Option<CallingPresentationSelector>,
+        #[rasn(tag(context, 2), identifier = "called-presentation-selector")]
+        pub called_presentation_selector: Option<CalledPresentationSelector>,
+        #[rasn(tag(context, 4), identifier = "presentation-context-definition-list")]
+        pub presentation_context_definition_list: Option<PresentationContextDefinitionList>,
+        #[rasn(tag(context, 6), identifier = "default-context-name")]
+        pub default_context_name: Option<DefaultContextName>,
+        #[rasn(tag(context, 8), identifier = "presentation-requirements")]
+        pub presentation_requirements: Option<PresentationRequirements>,
+        #[rasn(tag(context, 9), identifier = "user-session-requirements")]
+        pub user_session_requirements: Option<UserSessionRequirements>,
+        #[rasn(identifier = "user-data")]
+        pub user_data: Option<UserData>,
+    }
+    impl CPTypeNormalModeParameters {
+        pub fn new(
+            protocol_version: ProtocolVersion,
+            calling_presentation_selector: Option<CallingPresentationSelector>,
+            called_presentation_selector: Option<CalledPresentationSelector>,
+            presentation_context_definition_list: Option<PresentationContextDefinitionList>,
+            default_context_name: Option<DefaultContextName>,
+            presentation_requirements: Option<PresentationRequirements>,
+            user_session_requirements: Option<UserSessionRequirements>,
+            user_data: Option<UserData>,
+        ) -> Self {
+            Self {
+                protocol_version,
+                calling_presentation_selector,
+                called_presentation_selector,
+                presentation_context_definition_list,
+                default_context_name,
+                presentation_requirements,
+                user_session_requirements,
+                user_data,
+            }
+        }
+    }
+    fn cptype_normal_mode_parameters_protocol_version_default() -> ProtocolVersion {
+        ProtocolVersion([true].into_iter().collect())
+    }
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(set, identifier = "CP-type")]
+    pub struct CPType {
+        #[rasn(tag(context, 0), identifier = "mode-selector")]
+        pub mode_selector: ModeSelector,
+        #[rasn(tag(context, 2), identifier = "normal-mode-parameters")]
+        pub normal_mode_parameters: Option<CPTypeNormalModeParameters>,
+    }
+    impl CPType {
+        pub fn new(
+            mode_selector: ModeSelector,
+            normal_mode_parameters: Option<CPTypeNormalModeParameters>,
+        ) -> Self {
+            Self {
+                mode_selector,
+                normal_mode_parameters,
+            }
+        }
+    }
+    #[doc = " Inner type "]
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(tag(context, 2))]
+    pub struct CPAPPDUNormalModeParameters {
+        #[rasn(
+            tag(context, 0),
+            default = "cpappdunormal_mode_parameters_protocol_version_default",
+            identifier = "protocol-version"
+        )]
+        pub protocol_version: ProtocolVersion,
+        #[rasn(tag(context, 3), identifier = "responding-presentation-selector")]
+        pub responding_presentation_selector: Option<RespondingPresentationSelector>,
+        #[rasn(
+            tag(context, 5),
+            identifier = "presentation-context-definition-result-list"
+        )]
+        pub presentation_context_definition_result_list:
+            Option<PresentationContextDefinitionResultList>,
+        #[rasn(tag(context, 8), identifier = "presentation-requirements")]
+        pub presentation_requirements: Option<PresentationRequirements>,
+        #[rasn(tag(context, 9), identifier = "user-session-requirements")]
+        pub user_session_requirements: Option<UserSessionRequirements>,
+        #[rasn(identifier = "user-data")]
+        pub user_data: Option<UserData>,
+    }
+    impl CPAPPDUNormalModeParameters {
+        pub fn new(
+            protocol_version: ProtocolVersion,
+            responding_presentation_selector: Option<RespondingPresentationSelector>,
+            presentation_context_definition_result_list: Option<
+                PresentationContextDefinitionResultList,
+            >,
+            presentation_requirements: Option<PresentationRequirements>,
+            user_session_requirements: Option<UserSessionRequirements>,
+            user_data: Option<UserData>,
+        ) -> Self {
+            Self {
+                protocol_version,
+                responding_presentation_selector,
+                presentation_context_definition_result_list,
+                presentation_requirements,
+                user_session_requirements,
+                user_data,
+            }
+        }
+    }
+    fn cpappdunormal_mode_parameters_protocol_version_default() -> ProtocolVersion {
+        ProtocolVersion([true].into_iter().collect())
+    }
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(set, identifier = "CPA-PPDU")]
+    pub struct CPAPPDU {
+        #[rasn(tag(context, 0), identifier = "mode-selector")]
+        pub mode_selector: ModeSelector,
+        #[rasn(tag(context, 2), identifier = "normal-mode-parameters")]
+        pub normal_mode_parameters: Option<CPAPPDUNormalModeParameters>,
+    }
+    impl CPAPPDU {
+        pub fn new(
+            mode_selector: ModeSelector,
+            normal_mode_parameters: Option<CPAPPDUNormalModeParameters>,
+        ) -> Self {
+            Self {
+                mode_selector,
+                normal_mode_parameters,
+            }
+        }
+    }
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Called-presentation-selector")]
+    pub struct CalledPresentationSelector(pub PresentationSelector);
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Calling-presentation-selector")]
+    pub struct CallingPresentationSelector(pub PresentationSelector);
+    #[doc = " Anonymous SEQUENCE OF member "]
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(identifier = "SEQUENCE")]
+    pub struct AnonymousContextList {
+        #[rasn(identifier = "presentation-context-identifier")]
+        pub presentation_context_identifier: PresentationContextIdentifier,
+        #[rasn(identifier = "abstract-syntax-name")]
+        pub abstract_syntax_name: AbstractSyntaxName,
+        #[rasn(identifier = "transfer-syntax-name-list")]
+        pub transfer_syntax_name_list: SequenceOf<TransferSyntaxName>,
+    }
+    impl AnonymousContextList {
+        pub fn new(
+            presentation_context_identifier: PresentationContextIdentifier,
+            abstract_syntax_name: AbstractSyntaxName,
+            transfer_syntax_name_list: SequenceOf<TransferSyntaxName>,
+        ) -> Self {
+            Self {
+                presentation_context_identifier,
+                abstract_syntax_name,
+                transfer_syntax_name_list,
+            }
+        }
+    }
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Context-list")]
+    pub struct ContextList(pub SequenceOf<AnonymousContextList>);
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(identifier = "Default-context-name")]
+    pub struct DefaultContextName {
+        #[rasn(tag(context, 0), identifier = "abstract-syntax-name")]
+        pub abstract_syntax_name: AbstractSyntaxName,
+        #[rasn(tag(context, 1), identifier = "transfer-syntax-name")]
+        pub transfer_syntax_name: TransferSyntaxName,
+    }
+    impl DefaultContextName {
+        pub fn new(
+            abstract_syntax_name: AbstractSyntaxName,
+            transfer_syntax_name: TransferSyntaxName,
+        ) -> Self {
+            Self {
+                abstract_syntax_name,
+                transfer_syntax_name,
+            }
+        }
+    }
+    #[doc = "  See 8.4.1."]
+    #[doc = "Fully-encoded-data ::= SEQUENCE SIZE (1, ..., 2..MAX) OF PDV-list"]
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Fully-encoded-data")]
+    pub struct FullyEncodedData(pub SequenceOf<PDVList>);
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(set, identifier = "Mode-selector")]
+    pub struct ModeSelector {
+        #[rasn(tag(context, 0), identifier = "mode-value")]
+        pub mode_value: Integer,
+    }
+    impl ModeSelector {
+        pub fn new(mode_value: Integer) -> Self {
+            Self { mode_value }
+        }
+    }
+    #[doc = " Inner type "]
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(choice)]
+    pub enum PDVListPresentationDataValues {
+        #[rasn(tag(context, 0), identifier = "single-ASN1-type")]
+        single_ASN1_type(Any),
+        #[rasn(tag(context, 1), identifier = "octet-aligned")]
+        octet_aligned(OctetString),
+        #[rasn(tag(context, 2))]
+        arbitrary(BitString),
+    }
+    impl From<Any> for PDVListPresentationDataValues {
+        fn from(value: Any) -> Self {
+            Self::single_ASN1_type(value)
+        }
+    }
+    impl From<OctetString> for PDVListPresentationDataValues {
+        fn from(value: OctetString) -> Self {
+            Self::octet_aligned(value)
+        }
+    }
+    impl From<BitString> for PDVListPresentationDataValues {
+        fn from(value: BitString) -> Self {
+            Self::arbitrary(value)
+        }
+    }
+    #[doc = "  contains one or more PDV-list values."]
+    #[doc = "  See 8.4.2."]
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(identifier = "PDV-list")]
+    pub struct PDVList {
+        #[rasn(identifier = "transfer-syntax-name")]
+        pub transfer_syntax_name: Option<TransferSyntaxName>,
+        #[rasn(identifier = "presentation-context-identifier")]
+        pub presentation_context_identifier: PresentationContextIdentifier,
+        #[rasn(identifier = "presentation-data-values")]
+        pub presentation_data_values: PDVListPresentationDataValues,
+    }
+    impl PDVList {
+        pub fn new(
+            transfer_syntax_name: Option<TransferSyntaxName>,
+            presentation_context_identifier: PresentationContextIdentifier,
+            presentation_data_values: PDVListPresentationDataValues,
+        ) -> Self {
+            Self {
+                transfer_syntax_name,
+                presentation_context_identifier,
+                presentation_data_values,
+            }
+        }
+    }
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Presentation-context-definition-list")]
+    pub struct PresentationContextDefinitionList(pub ContextList);
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Presentation-context-definition-result-list")]
+    pub struct PresentationContextDefinitionResultList(pub ResultList);
+    #[doc = "Presentation-context-identifier ::= INTEGER(1..127, ..., 128..MAX)"]
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Presentation-context-identifier")]
+    pub struct PresentationContextIdentifier(pub Integer);
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Presentation-requirements")]
+    pub struct PresentationRequirements(pub BitString);
+    #[doc = "Presentation-selector ::= OCTET STRING(SIZE (1..4, ..., 5..MAX))"]
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Presentation-selector")]
+    pub struct PresentationSelector(pub OctetString);
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Protocol-version")]
+    pub struct ProtocolVersion(pub BitString);
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Responding-presentation-selector")]
+    pub struct RespondingPresentationSelector(pub PresentationSelector);
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate)]
+    pub struct Result(pub Integer);
+    #[doc = " Anonymous SEQUENCE OF member "]
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(identifier = "SEQUENCE")]
+    pub struct AnonymousResultList {
+        #[rasn(tag(context, 0))]
+        pub result: Result,
+        #[rasn(tag(context, 1), identifier = "transfer-syntax-name")]
+        pub transfer_syntax_name: Option<TransferSyntaxName>,
+        #[rasn(tag(context, 2), identifier = "provider-reason")]
+        pub provider_reason: Option<Integer>,
+    }
+    impl AnonymousResultList {
+        pub fn new(
+            result: Result,
+            transfer_syntax_name: Option<TransferSyntaxName>,
+            provider_reason: Option<Integer>,
+        ) -> Self {
+            Self {
+                result,
+                transfer_syntax_name,
+                provider_reason,
+            }
+        }
+    }
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Result-list")]
+    pub struct ResultList(pub SequenceOf<AnonymousResultList>);
+    #[doc = "  Subclause 8.4 defines when each of the two alternatives shall be used."]
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Simply-encoded-data")]
+    pub struct SimplyEncodedData(pub OctetString);
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "Transfer-syntax-name")]
+    pub struct TransferSyntaxName(pub ObjectIdentifier);
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(choice, identifier = "User-data")]
+    #[non_exhaustive]
+    pub enum UserData {
+        #[rasn(tag(application, 0), identifier = "simply-encoded-data")]
+        simply_encoded_data(SimplyEncodedData),
+        #[rasn(tag(application, 1), identifier = "fully-encoded-data")]
+        fully_encoded_data(FullyEncodedData),
+    }
+    impl From<SimplyEncodedData> for UserData {
+        fn from(value: SimplyEncodedData) -> Self {
+            Self::simply_encoded_data(value)
+        }
+    }
+    impl From<FullyEncodedData> for UserData {
+        fn from(value: FullyEncodedData) -> Self {
+            Self::fully_encoded_data(value)
+        }
+    }
+    #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+    #[rasn(delegate, identifier = "User-session-requirements")]
+    pub struct UserSessionRequirements(pub BitString);
+}

@@ -4,8 +4,9 @@ use snafu::Snafu;
 
 use tracing_error::SpanTrace;
 
-mod cotp;
-mod session;
+pub mod ans1;
+pub mod cotp;
+pub mod session;
 
 #[derive(Debug)]
 pub struct SpanTraceWrapper(SpanTrace);
