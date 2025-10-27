@@ -49,24 +49,22 @@ MMSpdu ::= CHOICE
 	confirmed-ErrorPDU		[2] 	IMPLICIT Confirmed-ErrorPDU,
 	unconfirmed-PDU			[3] 	IMPLICIT Unconfirmed-PDU,
 	rejectPDU			[4] 	IMPLICIT RejectPDU,
-	cancel-RequestPDU		[5] 	IMPLICIT Cancel-RequestPDU,
-	cancel-ResponsePDU		[6] 	IMPLICIT Cancel-ResponsePDU,
-	cancel-ErrorPDU			[7] 	IMPLICIT Cancel-ErrorPDU,
+	-- cancel-RequestPDU		[5] 	IMPLICIT Cancel-RequestPDU,
+	-- cancel-ResponsePDU		[6] 	IMPLICIT Cancel-ResponsePDU,
+	-- cancel-ErrorPDU			[7] 	IMPLICIT Cancel-ErrorPDU,
 	initiate-RequestPDU		[8] 	IMPLICIT Initiate-RequestPDU,
 	initiate-ResponsePDU		[9] 	IMPLICIT Initiate-ResponsePDU,
 	initiate-ErrorPDU		[10] 	IMPLICIT Initiate-ErrorPDU,
 	conclude-RequestPDU		[11] 	IMPLICIT Conclude-RequestPDU,
-	conclude-ResponsePDU		[12] 	IMPLICIT Conclude-ResponsePDU,
-	conclude-ErrorPDU		[13] 	IMPLICIT Conclude-ErrorPDU
+	-- conclude-ResponsePDU		[12] 	IMPLICIT Conclude-ResponsePDU,
+	-- conclude-ErrorPDU		[13] 	IMPLICIT Conclude-ErrorPDU
 	}
 
 
 Confirmed-RequestPDU ::= SEQUENCE
 	{
 	invokeID			Unsigned32,
-	listOfModifier			SEQUENCE OF Modifier OPTIONAL,
 	confirmedServiceRequest		ConfirmedServiceRequest,
-	cs-request-detail		[79] CS-Request-Detail OPTIONAL
 	}
 
 
@@ -478,21 +476,7 @@ ServiceSupportOptions ::= BIT STRING
 
 Conclude-RequestPDU ::= NULL
 
-Conclude-ResponsePDU ::= NULL
 
-Conclude-ErrorPDU ::= ServiceError
-
----------------------------------- CANCEL --------------------------------
-
-Cancel-RequestPDU ::= Unsigned32	-- originalInvokeID
-
-Cancel-ResponsePDU ::= Unsigned32 	-- originalInvokeID
-
-Cancel-ErrorPDU ::= SEQUENCE
-	{
-	originalInvokeID	[0] IMPLICIT Unsigned32,
-	serviceError		[1] IMPLICIT ServiceError
-	}
 
 ------------------------------ Service-Error --------------------------------
 

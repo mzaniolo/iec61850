@@ -10,7 +10,8 @@ use crate::mms::{
 /// Maximum size for session selectors (S-SEL)
 const MAX_SESSION_SELECTOR_SIZE: usize = 16;
 
-struct Session {
+#[derive(Debug)]
+pub struct Session {
     cotp_connection: CotpConnection,
     local_s_sel: SSelector,
     remote_s_sel: SSelector,

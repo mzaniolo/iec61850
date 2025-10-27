@@ -167,11 +167,11 @@ mod tests {
         let cp_type = CPType::new(mode_selector, Some(normal_mode_params));
 
         // Encode
-        let encoded = rasn::der::encode(&cp_type).expect("Failed to encode CP PDU");
+        let encoded = rasn::ber::encode(&cp_type).expect("Failed to encode CP PDU");
         assert!(!encoded.is_empty());
 
         // Decode
-        let decoded: CPType = rasn::der::decode(&encoded).expect("Failed to decode CP PDU");
+        let decoded: CPType = rasn::ber::decode(&encoded).expect("Failed to decode CP PDU");
 
         // Verify roundtrip
         assert_eq!(
@@ -187,5 +187,22 @@ mod tests {
         assert!(decoded_params.calling_presentation_selector.is_some());
         assert!(original_params.called_presentation_selector.is_some());
         assert!(decoded_params.called_presentation_selector.is_some());
+    }
+
+    #[test]
+    fn test_presentation_object_identifiers() {
+        let acse_context_id = rasn::ber::encode(&ObjectIdentifier::new(&[2, 2, 1, 0, 1]))
+            .expect("Failed to encode ACSE context ID");
+        let mms_context_id = rasn::ber::encode(&ObjectIdentifier::new(&[1, 0, 9506, 2, 1]))
+            .expect("Failed to encode MMS context ID");
+        let transfer_syntax_name = rasn::ber::encode(&ObjectIdentifier::new(&[2, 1, 1]))
+            .expect("Failed to encode transfer syntax name");
+
+        assert_eq!(acse_context_id, vec![0x06, 0x04, 0x52, 0x01, 0x00, 0x01]);
+        assert_eq!(
+            mms_context_id,
+            vec![0x06, 0x05, 0x28, 0xca, 0x22, 0x02, 0x01]
+        );
+        assert_eq!(transfer_syntax_name, vec![0x06, 0x02, 0x51, 0x01]);
     }
 }

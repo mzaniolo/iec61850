@@ -18,6 +18,7 @@ const COTP_MAX_TPDU_SIZE: usize = 8192;
 const COTP_DT_HEADER_SIZE: usize = 3;
 const TPKT_HEADER_SIZE: usize = 4;
 
+#[derive(Debug)]
 pub struct CotpConnection {
     connection: Connection,
     tpdu_size: u32,
@@ -686,6 +687,12 @@ pub struct ClientConfig {
     pub remote_t_sel: Vec<u8>,
     pub local_s_sel: Vec<u8>,
     pub remote_s_sel: Vec<u8>,
+    pub local_p_sel: Vec<u8>,
+    pub remote_p_sel: Vec<u8>,
+    pub local_ap_title: Option<Vec<u32>>,
+    pub remote_ap_title: Option<Vec<u32>>,
+    pub local_ae_qualifier: Option<u32>,
+    pub remote_ae_qualifier: Option<u32>,
     /// The TLS configuration.
     #[serde(default)]
     pub tls: Option<TlsClientConfig>,
