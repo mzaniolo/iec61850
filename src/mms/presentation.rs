@@ -2,10 +2,9 @@
 
 use rasn::{ber, prelude::*};
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
+use tracing::instrument;
 
-use crate::mms::{
-    SpanTraceWrapper, ans1::presentation::asn1::*, cotp::ClientConfig, session::Session,
-};
+use crate::mms::{ClientConfig, SpanTraceWrapper, ans1::presentation::asn1::*, session::Session};
 
 const ACSE_OID: [u32; 5] = [2, 2, 1, 0, 1];
 const MMS_OID: [u32; 5] = [1, 0, 9506, 2, 1];
@@ -34,6 +33,7 @@ impl Presentation {
             ))),
         })
     }
+    #[instrument(skip(self))]
     pub async fn connect(
         &mut self,
         data: Vec<u8>,
@@ -84,10 +84,9 @@ impl Presentation {
             Some(normal_mode_params),
         );
         let cp_bytes = ber::encode(&cp).context(EncodeCp)?;
-        let response = self.session.connect(&cp_bytes).await.context(SendCp)?;
+        let response = self.session.connect(&cp_bytes).await?;
         let cpa: CPAPPDU = ber::decode(&response).context(DecodeCpa)?;
         //TODO: Check the CPA for errors
-        println!("Response: {:?}", cpa);
 
         let user_data = cpa
             .normal_mode_parameters
@@ -115,8 +114,9 @@ impl Presentation {
             _ => UnsupportedPresentationDataValues.fail(),
         }
     }
+    #[instrument(skip(self))]
     pub async fn receive_data(&mut self) -> std::result::Result<(Vec<u8>, u64), PresentationError> {
-        let data = self.session.receive_data().await.context(ReceiveData)?;
+        let data = self.session.receive_data().await?;
         let data: UserData = ber::decode(&data).context(DecodeData)?;
         let mut pdvs = match data {
             UserData::fully_encoded_data(data) => data.0,
@@ -128,7 +128,7 @@ impl Presentation {
         let pdv = pdvs.pop().context(MissingPdv)?;
         if pdv
             .transfer_syntax_name
-            .is_none_or(|tsn| tsn.0 != ObjectIdentifier::new(&BER_OID).expect("BER OID is valid"))
+            .is_some_and(|tsn| tsn.0 != ObjectIdentifier::new(&BER_OID).expect("BER OID is valid"))
         {
             return UnsupportedTransferSyntax.fail();
         }
@@ -147,19 +147,20 @@ impl Presentation {
             _ => UnsupportedPresentationDataValues.fail(),
         }
     }
+    #[instrument(skip(self))]
     pub async fn send_data(&mut self, data: Vec<u8>) -> std::result::Result<(), PresentationError> {
         let data = UserData::fully_encoded_data(FullyEncodedData(vec![PDVList::new(
             None,
-            PresentationContextIdentifier(Integer::from(1)),
+            PresentationContextIdentifier(Integer::from(MMS_CONTEXT_ID)),
             PDVListPresentationDataValues::from(Any::from(data)),
         )]));
         let data = ber::encode(&data).context(EncodeData)?;
-        self.session.send_data(&data).await.context(SendData)?;
+        self.session.send_data(&data).await?;
         Ok(())
     }
 }
 
-/// Session layer errors
+/// Presentation layer errors
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum PresentationError {
@@ -179,20 +180,14 @@ pub enum PresentationError {
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
-    #[snafu(display("Error sending data to COTP"))]
-    SendData {
+    #[snafu(display("Error in session layer"))]
+    SessionLayer {
         source: super::session::SessionError,
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
     #[snafu(display("Unsupported transfer syntax"))]
     UnsupportedTransferSyntax {
-        #[snafu(implicit)]
-        context: Box<SpanTraceWrapper>,
-    },
-    #[snafu(display("Error receiving data"))]
-    ReceiveData {
-        source: super::session::SessionError,
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
@@ -239,16 +234,40 @@ pub enum PresentationError {
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
-    #[snafu(display("Error sending data to COTP"))]
-    SendCp {
-        source: super::session::SessionError,
-        #[snafu(implicit)]
-        context: Box<SpanTraceWrapper>,
-    },
     #[snafu(display("Error decoding CPA"))]
     DecodeCpa {
         source: ber::de::DecodeError,
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
+}
+
+impl PresentationError {
+    pub fn get_context(&self) -> &SpanTraceWrapper {
+        match self {
+            PresentationError::InvalidContextId { context } => context,
+            PresentationError::UnsupportedPresentationDataValues { context } => context,
+            PresentationError::EncodeData { context, .. } => context,
+            PresentationError::SessionLayer { context, .. } => context,
+            PresentationError::UnsupportedTransferSyntax { context } => context,
+            PresentationError::DecodeData { context, .. } => context,
+            PresentationError::MissingPdv { context } => context,
+            PresentationError::UnsupportedUserData { context } => context,
+            PresentationError::MissingNormalModeParameters { context } => context,
+            PresentationError::MissingUserData { context } => context,
+            PresentationError::CreateSession { context, .. } => context,
+            PresentationError::CreateObjectIdentifier { context } => context,
+            PresentationError::EncodeCp { context, .. } => context,
+            PresentationError::DecodeCpa { context, .. } => context,
+        }
+    }
+}
+
+impl From<super::session::SessionError> for PresentationError {
+    fn from(error: super::session::SessionError) -> Self {
+        PresentationError::SessionLayer {
+            context: Box::new((*error.get_context()).clone()),
+            source: error,
+        }
+    }
 }

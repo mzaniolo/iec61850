@@ -1,11 +1,12 @@
 // build.rs build script
-use rasn::compiler::prelude::*;
+use rasn_compiler::prelude::*;
 use std::error::Error;
 
 const BASE_PATH: &str = "src/mms/ans1";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let files = ["presentation", "acse"];
+    // let files = ["presentation", "acse", "mms"];
+    let files = ["mms"];
 
     for file in &files {
         println!("cargo::rerun-if-changed={}", ans1_file_path(file));

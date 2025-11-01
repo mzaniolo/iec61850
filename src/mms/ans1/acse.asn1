@@ -4,32 +4,29 @@
 --
 --
 -- Module ACSE-1 (X.227bis:09/1998)
-ACSE-1 {joint-iso-itu-t association-control(2) modules(0) acse1(1) version1(1)}
+ACSE-1 { joint-iso-itu-t association-control(2) modules(0) acse1(1) version1(1) }
 --  ACSE-1 refers to ACSE version 1
 DEFINITIONS ::=
 BEGIN
 
 -- IMPORTS
 --   Name, RelativeDistinguishedName
---     FROM InformationFramework {joint-iso-itu-t ds(5) module(1)
---       informationFramework(1) 3};
+--     FROM InformationFramework { joint-iso-itu-t ds(5) module(1)
+--       informationFramework(1) 3 } ;
 
 -- EXPORTS
 --   acse-as-id, ACSE-apdu, aCSE-id, ASO-context-name, AP_title,
 --     AE_qualifier, AE_title, AP_invocation_identifier, AE_invocation_identifier,
 --     Mechanism_name, Authentication_value, ACSE_requirements, ObjectSet;
 
-
-
-
 --  object identifier assignments
 acse-as-id OBJECT IDENTIFIER ::=
   {joint-iso-itu-t association-control(2) abstract-syntax(1) apdus(0)
-   version1(1)}
+   version1(1) }
 
 --  may be used to reference the abstract syntax of the ACSE APDUs.
 aCSE-id OBJECT IDENTIFIER ::=
-  {joint-iso-itu-t association-control(2) ase-id(3) acse-ase(1) version(1)}
+  {joint-iso-itu-t association-control(2) ase-id(3) acse-ase(1) version(1) }
 
 --  may be used to identify the Association Control ASE.
 --  top level CHOICE
@@ -47,16 +44,16 @@ ACSE-apdu ::= CHOICE {
 
 AARQ-apdu ::= [APPLICATION 0] IMPLICIT SEQUENCE {
   protocol-version
-    [0] IMPLICIT BIT STRING {version1(0)} DEFAULT {version1},
-  aSO-context-name                  [1]  ASO-context-name,
-  called-AP-title                   [2]  AP-title OPTIONAL,
-  called-AE-qualifier               [3]  AE-qualifier OPTIONAL,
-  called-AP-invocation-identifier   [4]  AP-invocation-identifier OPTIONAL,
-  called-AE-invocation-identifier   [5]  AE-invocation-identifier OPTIONAL,
-  calling-AP-title                  [6]  AP-title OPTIONAL,
-  calling-AE-qualifier              [7]  AE-qualifier OPTIONAL,
-  calling-AP-invocation-identifier  [8]  AP-invocation-identifier OPTIONAL,
-  calling-AE-invocation-identifier  [9]  AE-invocation-identifier OPTIONAL,
+    [0] IMPLICIT BIT STRING OPTIONAL,
+  application-context-name          [1]  EXPLICIT OBJECT IDENTIFIER,
+  called-AP-title                   [2]  EXPLICIT AP-title OPTIONAL,
+  called-AE-qualifier               [3]  EXPLICIT AE-qualifier OPTIONAL,
+  called-AP-invocation-identifier   [4]  EXPLICIT AP-invocation-identifier OPTIONAL,
+  called-AE-invocation-identifier   [5]  EXPLICIT AE-invocation-identifier OPTIONAL,
+  calling-AP-title                  [6]  EXPLICIT AP-title OPTIONAL,
+  calling-AE-qualifier              [7]  EXPLICIT AE-qualifier OPTIONAL,
+  calling-AP-invocation-identifier  [8]  EXPLICIT AP-invocation-identifier OPTIONAL,
+  calling-AE-invocation-identifier  [9]  EXPLICIT AE-invocation-identifier OPTIONAL,
   --  The following field shall not be present if only the Kernel is used.
   sender-acse-requirements          [10] IMPLICIT ACSE-requirements OPTIONAL,
   --  The following field shall only be present if the Authentication functional unit is selected.
@@ -72,14 +69,14 @@ AARQ-apdu ::= [APPLICATION 0] IMPLICIT SEQUENCE {
 
 AARE-apdu ::= [APPLICATION 1] IMPLICIT SEQUENCE {
   protocol-version
-    [0] IMPLICIT BIT STRING {version1(0)} DEFAULT {version1},
-  aSO-context-name                     [1]  ASO-context-name,
-  result                               [2]  Associate-result,
-  result-source-diagnostic             [3]  Associate-source-diagnostic,
-  responding-AP-title                  [4]  AP-title OPTIONAL,
-  responding-AE-qualifier              [5]  AE-qualifier OPTIONAL,
-  responding-AP-invocation-identifier  [6]  AP-invocation-identifier OPTIONAL,
-  responding-AE-invocation-identifier  [7]  AE-invocation-identifier OPTIONAL,
+    [0] IMPLICIT BIT STRING { version1(0) } DEFAULT {version1},
+  application-context-name             [1]  EXPLICIT OBJECT IDENTIFIER,
+  result                               [2]  EXPLICIT Associate-result,
+  result-source-diagnostic             [3]  EXPLICIT Associate-source-diagnostic,
+  responding-AP-title                  [4]  EXPLICIT AP-title OPTIONAL,
+  responding-AE-qualifier              [5]  EXPLICIT AE-qualifier OPTIONAL,
+  responding-AP-invocation-identifier  [6]  EXPLICIT AP-invocation-identifier OPTIONAL,
+  responding-AE-invocation-identifier  [7]  EXPLICIT AE-invocation-identifier OPTIONAL,
   --  The following field shall not be present if only the Kernel is used.
   responder-acse-requirements          [8] IMPLICIT ACSE-requirements OPTIONAL,
   --  The following field shall only be present if the Authentication functional unit is selected.
@@ -107,7 +104,7 @@ RLRE-apdu ::= [APPLICATION 3] IMPLICIT SEQUENCE {
 
 ACSE-requirements ::= BIT STRING {
   authentication(0), aSO-context-negotiation(1), higher-level-association(2),
-  nested-association(3)}
+  nested-association(3) }
 
 ASO-context-name ::= OBJECT IDENTIFIER
 
@@ -122,19 +119,15 @@ ASO-qualifier ::= CHOICE {
   aso-qualifier-form2  ASO-qualifier-form2,
 }
 
-
 --  The value assigned to AE-qualifier-form1 is the relative distinguished name of a particular
 --  application-entity of the application-process identified by AP-title-form1.
 AP-title-form2 ::= OBJECT IDENTIFIER
 
 ASO-qualifier-form2 ::= INTEGER
 
-
 AE-title ::= CHOICE {
   ae-title-form2  AE-title-form2
 }
-
-
 
 --  For access to The Directory (see ITU-T Rec. X.500 series | ISO/IEC 9594), an AE title has AE-title-form1. This value
 --  can be constructed from AP-title-form1 and AE-qualifier-form1 values contained in an AARQ or AARE APDU.
@@ -148,17 +141,16 @@ AE-invocation-identifier ::= INTEGER
 
 AP-invocation-identifier ::= INTEGER
 
-
 --  End of Application-entity title productions
 
 ASO-context-name-list ::= SEQUENCE OF ASO-context-name
 
 Associate-result ::= INTEGER {
-  accepted(0), rejected-permanent(1), rejected-transient(2)}(0..2, ...)
+  accepted(0), rejected-permanent(1), rejected-transient(2) } (0..2, ...)
 
 Associate-source-diagnostic ::= CHOICE {
   service-user
-    [1]  INTEGER {null(0), no-reason-given(1),
+    [1]  INTEGER { null(0), no-reason-given(1),
                   application-context-name-not-supported(2),
                   calling-AP-title-not-recognized(3),
                   calling-AP-invocation-identifier-not-recognized(4),
@@ -170,37 +162,35 @@ Associate-source-diagnostic ::= CHOICE {
                   called-AE-invocation-identifier-not-recognized(10),
                   authentication-mechanism-name-not-recognized(11),
                   authentication-mechanism-name-required(12),
-                  authentication-failure(13), authentication-required(14)}
+                  authentication-failure(13), authentication-required(14) }
                                                                     (0..14, ...),
   service-provider
-    [2]  INTEGER {null(0), no-reason-given(1), no-common-acse-version(2)}
+    [2]  INTEGER { null(0), no-reason-given(1), no-common-acse-version(2) }
                                                                     (0..2, ...)
 }
 
-
 Association-data ::= SEQUENCE OF Myexternal
 
-Myexternal  ::=  [UNIVERSAL 8] IMPLICIT SEQUENCE {
+Myexternal ::= [UNIVERSAL 8] IMPLICIT SEQUENCE {
       direct-reference  OBJECT IDENTIFIER OPTIONAL,
       indirect-reference  INTEGER OPTIONAL,
       encoding  CHOICE
                   {single-ASN1-type  [0] ANY,
                    octet-aligned     [1] IMPLICIT OCTET STRING,
-                   arbitrary         [2] IMPLICIT BIT STRING}
+                   arbitrary         [2] IMPLICIT BIT STRING }
 }
 
-Myexternal2  ::=  [UNIVERSAL 8] IMPLICIT SEQUENCE
+Myexternal2 ::= [UNIVERSAL 8] IMPLICIT SEQUENCE
 {
       direct-reference  OBJECT IDENTIFIER OPTIONAL,
       indirect-reference  INTEGER OPTIONAL,
       encoding  CHOICE
                   {single-ASN1-type  [0] ANY,
                    octet-aligned     [1] IMPLICIT OCTET STRING,
-                   arbitrary         [2] IMPLICIT BIT STRING}
+                   arbitrary         [2] IMPLICIT BIT STRING }
 }
 
 Simply-encoded-data ::= OCTET STRING
-
 
 Presentation-context-identifier ::= INTEGER
 
@@ -227,11 +217,11 @@ Implementation-data ::= GraphicString
 
 Mechanism-name ::= OBJECT IDENTIFIER
 
-Release-request-reason ::= INTEGER {normal(0), urgent(1), user-defined(30)
+Release-request-reason ::= INTEGER { normal(0), urgent(1), user-defined(30)
 }
 
 Release-response-reason ::= INTEGER {
-  normal(0), not-finished(1), user-defined(30)}
+  normal(0), not-finished(1), user-defined(30) }
 
 END
 

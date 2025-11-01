@@ -176,3 +176,13 @@ asn1 classes def: <https://github.com/beanit/iec61850bean/blob/master/asn1/readm
 asn1 from wireshark: <https://github.com/wireshark/wireshark/blob/master/epan/dissectors/asn1/mms/mms.asn>
 
 <https://sislab.no/MMS_Notat.pdf>
+
+
+| IEC61850 Obj | MMS Obj |
+|--------------|---------|
+| Server | VMD |
+| LD | Domain|
+| LN | NamedVariable |
+| Data | NamedComponent |
+| DataAttr | NamedComponent |
+| DataSet | NamedVariableList |

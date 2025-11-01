@@ -1,7 +1,6 @@
 use std::pin::Pin;
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use snafu::{OptionExt as _, ResultExt as _, Snafu, whatever};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -11,12 +10,12 @@ use tokio_native_tls::{
 };
 use tracing::instrument;
 
-use crate::mms::SpanTraceWrapper;
+use crate::mms::{ClientConfig, SpanTraceWrapper, TlsClientConfig};
 
-const TPKT_VERSION: u8 = 0x03;
-const COTP_MAX_TPDU_SIZE: usize = 8192;
-const COTP_DT_HEADER_SIZE: usize = 3;
-const TPKT_HEADER_SIZE: usize = 4;
+pub(super) const TPKT_VERSION: u8 = 0x03;
+pub(super) const COTP_MAX_TPDU_SIZE: u32 = 8192;
+pub(super) const COTP_DT_HEADER_SIZE: usize = 3;
+pub(super) const TPKT_HEADER_SIZE: usize = 4;
 
 #[derive(Debug)]
 pub struct CotpConnection {
@@ -25,21 +24,18 @@ pub struct CotpConnection {
 }
 
 impl CotpConnection {
-    #[instrument(level = "debug")]
-    pub async fn connect(config: &ClientConfig) -> Result<Self, Error> {
+    #[instrument]
+    pub async fn connect(config: &ClientConfig) -> Result<Self, CotpError> {
         let connection = make_connection(config).await?;
         Self::request_connection(connection, config).await
     }
-    #[instrument(level = "debug", skip(config))]
+    #[instrument(skip(config))]
     async fn request_connection(
         mut connection: Connection,
         config: &ClientConfig,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, CotpError> {
         let options = vec![
-            CotpOptions::TpduSize(TpduSize {
-                //TODO: Make this configurable
-                value: COTP_MAX_TPDU_SIZE as u8,
-            }),
+            CotpOptions::TpduSize(TpduSize::new(config.tpdu_size)),
             CotpOptions::TSelDst(TselDst {
                 value: config.remote_t_sel.clone(),
             }),
@@ -66,15 +62,24 @@ impl CotpConnection {
         {
             return Ok(Self {
                 connection,
-                //TODO: Fix this
-                tpdu_size: COTP_MAX_TPDU_SIZE as u32,
+                tpdu_size: cc_tpdu
+                    .options
+                    .iter()
+                    .find_map(|option| {
+                        if let CotpOptions::TpduSize(tpdu_size) = option {
+                            Some(tpdu_size.get_value())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(COTP_MAX_TPDU_SIZE),
             });
         }
 
         ConnectionFailed.fail()
     }
-    #[instrument(level = "debug", skip(self))]
-    pub async fn send_data(&mut self, data: &[u8]) -> Result<(), Error> {
+    #[instrument(skip(self))]
+    pub async fn send_data(&mut self, data: &[u8]) -> Result<(), CotpError> {
         let max_dt_data_size = self.tpdu_size as usize - COTP_DT_HEADER_SIZE;
         let num_dts = data.len().div_ceil(max_dt_data_size);
         let buffer_size = num_dts * (TPKT_HEADER_SIZE + COTP_DT_HEADER_SIZE) + data.len();
@@ -97,8 +102,8 @@ impl CotpConnection {
 
         Ok(())
     }
-    #[instrument(level = "debug", skip(self))]
-    pub async fn receive_data(&mut self) -> Result<Vec<u8>, Error> {
+    #[instrument(skip(self))]
+    pub async fn receive_data(&mut self) -> Result<Vec<u8>, CotpError> {
         let mut data = Vec::new();
         loop {
             match Self::read_tpkt(&mut self.connection).await {
@@ -120,8 +125,8 @@ impl CotpConnection {
         Ok(data)
     }
 
-    #[instrument(level = "debug", skip(connection))]
-    async fn read_tpkt(connection: &mut Connection) -> Result<Tpkt, Error> {
+    #[instrument(skip(connection))]
+    async fn read_tpkt(connection: &mut Connection) -> Result<Tpkt, CotpError> {
         let mut buffer = [0; TPKT_HEADER_SIZE];
         connection
             .read_exact(&mut buffer)
@@ -182,7 +187,7 @@ enum Cotp {
 
 impl Cotp {
     #[instrument(level = "debug")]
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
         match (*bytes.get(1).context(NotEnoughBytes)?).into() {
             TpduType::CR => CrTpdu::from_bytes(bytes).map(Self::Cr),
             TpduType::CC => CcTpdu::from_bytes(bytes).map(Self::Cc),
@@ -251,7 +256,7 @@ impl CrTpdu {
         }
     }
     #[instrument(level = "debug")]
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
         let li = *bytes.first().context(NotEnoughBytes)?;
 
         if *bytes.get(1).context(NotEnoughBytes)? != TpduType::CR as u8 {
@@ -322,7 +327,7 @@ impl CcTpdu {
         }
     }
     #[instrument(level = "debug")]
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
         let li = *bytes.first().context(NotEnoughBytes)?;
 
         if *bytes.get(1).context(NotEnoughBytes)? != TpduType::CC as u8 {
@@ -385,7 +390,7 @@ impl DtTpdu {
         Self { eot, data }
     }
     #[instrument(level = "debug")]
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
         if *bytes.first().context(NotEnoughBytes)? != 0x02 {
             return InvalidLiValue {
                 value: *bytes.first().context(NotEnoughBytes)?,
@@ -428,7 +433,7 @@ enum Eot {
 }
 
 impl TryFrom<u8> for Eot {
-    type Error = Error;
+    type Error = CotpError;
     #[instrument(level = "debug")]
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -440,7 +445,7 @@ impl TryFrom<u8> for Eot {
 }
 
 #[instrument(level = "debug")]
-fn bytes_to_options(bytes: &[u8]) -> Result<Vec<CotpOptions>, Error> {
+fn bytes_to_options(bytes: &[u8]) -> Result<Vec<CotpOptions>, CotpError> {
     let mut options = Vec::new();
     let mut start = 0;
     while start < bytes.len() {
@@ -517,8 +522,25 @@ struct TpduSize {
 }
 
 impl TpduSize {
+    pub fn new(value: u32) -> Self {
+        Self {
+            value: Self::calculate_value(value),
+        }
+    }
+    pub fn get_value(&self) -> u32 {
+        1 << self.value
+    }
+    pub fn set_value(&mut self, value: u32) {
+        self.value = Self::calculate_value(value);
+    }
+    fn calculate_value(mut value: u32) -> u8 {
+        if value > COTP_MAX_TPDU_SIZE || value < 1 {
+            value = COTP_MAX_TPDU_SIZE;
+        }
+        value.ilog2() as u8
+    }
     #[instrument(level = "debug")]
-    fn from_bytes(bytes: &[u8; 3]) -> Result<Self, Error> {
+    fn from_bytes(bytes: &[u8; 3]) -> Result<Self, CotpError> {
         if bytes[0] != 0xc0 {
             return InvalidTpduSize.fail();
         }
@@ -544,7 +566,7 @@ struct TselDst {
 
 impl TselDst {
     #[instrument(level = "debug")]
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
         if *bytes.first().context(NotEnoughBytes)? != 0xc2 {
             return InvalidTselDst.fail();
         }
@@ -574,7 +596,7 @@ struct TselSrc {
 
 impl TselSrc {
     #[instrument(level = "debug")]
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
         if *bytes.first().context(NotEnoughBytes)? != 0xc1 {
             return InvalidTselSrc.fail();
         }
@@ -600,7 +622,7 @@ impl TselSrc {
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
-pub enum Error {
+pub enum CotpError {
     #[snafu(display("Invalid LI value. Expected: {:x}, Got: {:x}", expected, value))]
     InvalidLiValue {
         value: u8,
@@ -676,52 +698,24 @@ pub enum Error {
     },
 }
 
-//TODO: Split this into multiple configs
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ClientConfig {
-    /// The address of the server.
-    pub address: String,
-    /// The port of the server.
-    pub port: u16,
-    pub local_t_sel: Vec<u8>,
-    pub remote_t_sel: Vec<u8>,
-    pub local_s_sel: Vec<u8>,
-    pub remote_s_sel: Vec<u8>,
-    pub local_p_sel: Vec<u8>,
-    pub remote_p_sel: Vec<u8>,
-    pub local_ap_title: Option<Vec<u32>>,
-    pub remote_ap_title: Option<Vec<u32>>,
-    pub local_ae_qualifier: Option<u32>,
-    pub remote_ae_qualifier: Option<u32>,
-    /// The TLS configuration.
-    #[serde(default)]
-    pub tls: Option<TlsClientConfig>,
-}
-
-/// The client TLS configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TlsClientConfig {
-    /// Path to the client key; if not specified, it will be assumed
-    /// that the server is configured not to verify client
-    /// certificates.
-    #[serde(default)]
-    pub client_key: Option<PathBuf>,
-    /// Path to the client certificate; if not specified, it will be
-    /// assumed that the server is configured not to verify client
-    /// certificates.
-    #[serde(default)]
-    pub client_certificate: Option<PathBuf>,
-    /// Path to the server certificate; if not specified, the host's
-    /// CA will be used to verify the server.
-    #[serde(default)]
-    pub server_certificate: Option<PathBuf>,
-    /// Whether to verify the server's certificates.
-    ///
-    /// This should normally only be used in test environments, as
-    /// disabling certificate validation defies the purpose of using
-    /// TLS in the first place.
-    #[serde(default)]
-    pub danger_disable_tls_verify: bool,
+impl CotpError {
+    pub fn get_context(&self) -> &SpanTraceWrapper {
+        match self {
+            CotpError::InvalidLiValue { context, .. } => context,
+            CotpError::WrongCotpType { context } => context,
+            CotpError::ConnectionFailed { context } => context,
+            CotpError::InvalidTpktVersion { context } => context,
+            CotpError::InvalidTpduOption { context } => context,
+            CotpError::InvalidTpduSize { context } => context,
+            CotpError::InvalidTselDst { context } => context,
+            CotpError::InvalidTselSrc { context } => context,
+            CotpError::InvalidEot { context } => context,
+            CotpError::InvalidTpduType { context, .. } => context,
+            CotpError::SizedSlice { context, .. } => context,
+            CotpError::NotEnoughBytes { context } => context,
+            CotpError::Whatever { context, .. } => context,
+        }
+    }
 }
 
 /// Connection
@@ -732,7 +726,7 @@ enum Connection {
 }
 
 #[instrument(level = "debug")]
-async fn make_connection(config: &ClientConfig) -> Result<Connection, Error> {
+async fn make_connection(config: &ClientConfig) -> Result<Connection, CotpError> {
     let stream = tokio::time::timeout(
         //TODO: Make this configurable
         Duration::from_secs(10),
@@ -756,7 +750,7 @@ async fn make_connection(config: &ClientConfig) -> Result<Connection, Error> {
 }
 
 #[instrument(level = "debug")]
-fn make_tls_connector(tls: &TlsClientConfig) -> Result<TlsConnector, Error> {
+fn make_tls_connector(tls: &TlsClientConfig) -> Result<TlsConnector, CotpError> {
     let root_cert: Option<Certificate> = tls
         .server_certificate
         .as_ref()
@@ -867,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eot_try_from() -> Result<(), Error> {
+    fn test_eot_try_from() -> Result<(), CotpError> {
         assert_eq!(Eot::try_from(0x00)?, Eot::NoEot);
         assert_eq!(Eot::try_from(0x80)?, Eot::Eot);
         assert!(Eot::try_from(0x40).is_err());

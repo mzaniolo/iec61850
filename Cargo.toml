@@ -22,4 +22,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 lazy_static = "1.5.0"
 
 [build-dependencies]
-rasn = { version = "0.28.0", features = ["compiler"] }
+rasn-compiler = "0.14.3"
+
+[dev-dependencies]
+rust-telemetry = { version = "1.2.0", features = ["tracing-error"] }

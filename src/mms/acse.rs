@@ -1,9 +1,9 @@
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
+use tracing::instrument;
 
 use crate::mms::{
-    SpanTraceWrapper,
+    ClientConfig, SpanTraceWrapper,
     ans1::acse::acse_1::*,
-    cotp::ClientConfig,
     presentation::{Presentation, PresentationError},
 };
 use rasn::{ber, prelude::*};
@@ -18,10 +18,9 @@ pub struct Acse {
 }
 
 impl Acse {
+    #[instrument(skip(config))]
     pub async fn new(config: &ClientConfig) -> Result<Self, AcseError> {
-        let presentation = Presentation::new(config)
-            .await
-            .context(CreatePresentation)?;
+        let presentation = Presentation::new(config).await?;
         Ok(Self {
             presentation,
             local_ap_title: config.local_ap_title.clone(),
@@ -30,13 +29,12 @@ impl Acse {
             remote_ae_qualifier: config.remote_ae_qualifier,
         })
     }
+    #[instrument(skip(self))]
     pub async fn connect(&mut self, data: Vec<u8>) -> Result<Vec<u8>, AcseError> {
         //TODO: Handle Auth parameters
         let aarq = AARQApdu::new(
-            [true].into_iter().collect(),
-            ASOContextName(
-                ObjectIdentifier::new(&ASO_CONTEXT_NAME).context(CreateObjectIdentifier)?,
-            ),
+            None,
+            ObjectIdentifier::new(&ASO_CONTEXT_NAME).context(CreateObjectIdentifier)?,
             self.remote_ap_title.as_ref().and_then(|title| {
                 ObjectIdentifier::new(title.clone())
                     .map(APTitleForm2)
@@ -71,8 +69,7 @@ impl Acse {
         let (data, context_id) = self
             .presentation
             .connect(ber::encode(&aarq).context(EncodeAarq)?)
-            .await
-            .context(Connect)?;
+            .await?;
         let aare: AAREApdu = ber::decode(&data).context(DecodeAare)?;
 
         //Check if the AARE result is successful
@@ -91,16 +88,14 @@ impl Acse {
         }
     }
 
+    #[instrument(skip(self))]
     pub async fn send_data(&mut self, data: Vec<u8>) -> Result<(), AcseError> {
-        self.presentation.send_data(data).await.context(SendData)
+        Ok(self.presentation.send_data(data).await?)
     }
 
+    #[instrument(skip(self))]
     pub async fn receive_data(&mut self) -> Result<Vec<u8>, AcseError> {
-        let (data, context_id) = self
-            .presentation
-            .receive_data()
-            .await
-            .context(ReceiveData)?;
+        let (data, context_id) = self.presentation.receive_data().await?;
         //TODO: Handle context id
         Ok(data)
     }
@@ -109,18 +104,13 @@ impl Acse {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum AcseError {
-    #[snafu(display("Error receiving data"))]
-    ReceiveData {
+    #[snafu(display("Error in presentation layer"))]
+    PresentationLayer {
         source: PresentationError,
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
-    #[snafu(display("Error sending data"))]
-    SendData {
-        source: PresentationError,
-        #[snafu(implicit)]
-        context: Box<SpanTraceWrapper>,
-    },
+
     #[snafu(display("Wrong user information encoding"))]
     WrongUserInformationEncoding {
         #[snafu(implicit)]
@@ -153,16 +143,27 @@ pub enum AcseError {
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
-    #[snafu(display("Error creating presentation"))]
-    CreatePresentation {
-        source: PresentationError,
-        #[snafu(implicit)]
-        context: Box<SpanTraceWrapper>,
-    },
-    #[snafu(display("Error connecting to presentation"))]
-    Connect {
-        source: PresentationError,
-        #[snafu(implicit)]
-        context: Box<SpanTraceWrapper>,
-    },
+}
+
+impl AcseError {
+    pub fn get_context(&self) -> &SpanTraceWrapper {
+        match self {
+            AcseError::PresentationLayer { context, .. } => context,
+            AcseError::WrongUserInformationEncoding { context } => context,
+            AcseError::MissingUserInformation { context } => context,
+            AcseError::DecodeAare { context, .. } => context,
+            AcseError::AareResultNotSuccessful { context } => context,
+            AcseError::EncodeAarq { context, .. } => context,
+            AcseError::CreateObjectIdentifier { context } => context,
+        }
+    }
+}
+
+impl From<PresentationError> for AcseError {
+    fn from(error: PresentationError) -> Self {
+        AcseError::PresentationLayer {
+            context: Box::new((*error.get_context()).clone()),
+            source: error,
+        }
+    }
 }

@@ -8,8 +8,8 @@
 pub mod acse_1 {
     extern crate alloc;
     use core::borrow::Borrow;
-    use lazy_static::lazy_static;
     use rasn::prelude::*;
+    use std::sync::LazyLock;
     #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
     #[rasn(tag(application, 1), identifier = "AARE-apdu")]
     pub struct AAREApdu {
@@ -19,20 +19,26 @@ pub mod acse_1 {
             identifier = "protocol-version"
         )]
         pub protocol_version: BitString,
-        #[rasn(tag(context, 1), identifier = "aSO-context-name")]
-        pub a_so_context_name: ASOContextName,
-        #[rasn(tag(context, 2))]
+        #[rasn(tag(explicit(context, 1)), identifier = "application-context-name")]
+        pub application_context_name: ObjectIdentifier,
+        #[rasn(tag(explicit(context, 2)))]
         pub result: AssociateResult,
-        #[rasn(tag(context, 3), identifier = "result-source-diagnostic")]
+        #[rasn(tag(explicit(context, 3)), identifier = "result-source-diagnostic")]
         pub result_source_diagnostic: AssociateSourceDiagnostic,
-        #[rasn(tag(context, 4), identifier = "responding-AP-title")]
-        pub responding__ap_title: Option<APTitle>,
-        #[rasn(tag(context, 5), identifier = "responding-AE-qualifier")]
-        pub responding__ae_qualifier: Option<AEQualifier>,
-        #[rasn(tag(context, 6), identifier = "responding-AP-invocation-identifier")]
-        pub responding__ap_invocation_identifier: Option<APInvocationIdentifier>,
-        #[rasn(tag(context, 7), identifier = "responding-AE-invocation-identifier")]
-        pub responding__ae_invocation_identifier: Option<AEInvocationIdentifier>,
+        #[rasn(tag(explicit(context, 4)), identifier = "responding-AP-title")]
+        pub responding_ap_title: Option<APTitle>,
+        #[rasn(tag(explicit(context, 5)), identifier = "responding-AE-qualifier")]
+        pub responding_ae_qualifier: Option<AEQualifier>,
+        #[rasn(
+            tag(explicit(context, 6)),
+            identifier = "responding-AP-invocation-identifier"
+        )]
+        pub responding_ap_invocation_identifier: Option<APInvocationIdentifier>,
+        #[rasn(
+            tag(explicit(context, 7)),
+            identifier = "responding-AE-invocation-identifier"
+        )]
+        pub responding_ae_invocation_identifier: Option<AEInvocationIdentifier>,
         #[rasn(tag(context, 8), identifier = "responder-acse-requirements")]
         pub responder_acse_requirements: Option<ACSERequirements>,
         #[rasn(tag(context, 9), identifier = "mechanism-name")]
@@ -52,13 +58,13 @@ pub mod acse_1 {
     impl AAREApdu {
         pub fn new(
             protocol_version: BitString,
-            a_so_context_name: ASOContextName,
+            application_context_name: ObjectIdentifier,
             result: AssociateResult,
             result_source_diagnostic: AssociateSourceDiagnostic,
-            responding__ap_title: Option<APTitle>,
-            responding__ae_qualifier: Option<AEQualifier>,
-            responding__ap_invocation_identifier: Option<APInvocationIdentifier>,
-            responding__ae_invocation_identifier: Option<AEInvocationIdentifier>,
+            responding_ap_title: Option<APTitle>,
+            responding_ae_qualifier: Option<AEQualifier>,
+            responding_ap_invocation_identifier: Option<APInvocationIdentifier>,
+            responding_ae_invocation_identifier: Option<AEInvocationIdentifier>,
             responder_acse_requirements: Option<ACSERequirements>,
             mechanism_name: Option<MechanismName>,
             responding_authentication_value: Option<AuthenticationValue>,
@@ -68,13 +74,13 @@ pub mod acse_1 {
         ) -> Self {
             Self {
                 protocol_version,
-                a_so_context_name,
+                application_context_name,
                 result,
                 result_source_diagnostic,
-                responding__ap_title,
-                responding__ae_qualifier,
-                responding__ap_invocation_identifier,
-                responding__ae_invocation_identifier,
+                responding_ap_title,
+                responding_ae_qualifier,
+                responding_ap_invocation_identifier,
+                responding_ae_invocation_identifier,
                 responder_acse_requirements,
                 mechanism_name,
                 responding_authentication_value,
@@ -90,30 +96,38 @@ pub mod acse_1 {
     #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
     #[rasn(tag(application, 0), identifier = "AARQ-apdu")]
     pub struct AARQApdu {
+        #[rasn(tag(context, 0), identifier = "protocol-version")]
+        pub protocol_version: Option<BitString>,
+        #[rasn(tag(explicit(context, 1)), identifier = "application-context-name")]
+        pub application_context_name: ObjectIdentifier,
+        #[rasn(tag(explicit(context, 2)), identifier = "called-AP-title")]
+        pub called_ap_title: Option<APTitle>,
+        #[rasn(tag(explicit(context, 3)), identifier = "called-AE-qualifier")]
+        pub called_ae_qualifier: Option<AEQualifier>,
         #[rasn(
-            tag(context, 0),
-            default = "aarqapdu_protocol_version_default",
-            identifier = "protocol-version"
+            tag(explicit(context, 4)),
+            identifier = "called-AP-invocation-identifier"
         )]
-        pub protocol_version: BitString,
-        #[rasn(tag(context, 1), identifier = "aSO-context-name")]
-        pub a_so_context_name: ASOContextName,
-        #[rasn(tag(context, 2), identifier = "called-AP-title")]
-        pub called__ap_title: Option<APTitle>,
-        #[rasn(tag(context, 3), identifier = "called-AE-qualifier")]
-        pub called__ae_qualifier: Option<AEQualifier>,
-        #[rasn(tag(context, 4), identifier = "called-AP-invocation-identifier")]
-        pub called__ap_invocation_identifier: Option<APInvocationIdentifier>,
-        #[rasn(tag(context, 5), identifier = "called-AE-invocation-identifier")]
-        pub called__ae_invocation_identifier: Option<AEInvocationIdentifier>,
-        #[rasn(tag(context, 6), identifier = "calling-AP-title")]
-        pub calling__ap_title: Option<APTitle>,
-        #[rasn(tag(context, 7), identifier = "calling-AE-qualifier")]
-        pub calling__ae_qualifier: Option<AEQualifier>,
-        #[rasn(tag(context, 8), identifier = "calling-AP-invocation-identifier")]
-        pub calling__ap_invocation_identifier: Option<APInvocationIdentifier>,
-        #[rasn(tag(context, 9), identifier = "calling-AE-invocation-identifier")]
-        pub calling__ae_invocation_identifier: Option<AEInvocationIdentifier>,
+        pub called_ap_invocation_identifier: Option<APInvocationIdentifier>,
+        #[rasn(
+            tag(explicit(context, 5)),
+            identifier = "called-AE-invocation-identifier"
+        )]
+        pub called_ae_invocation_identifier: Option<AEInvocationIdentifier>,
+        #[rasn(tag(explicit(context, 6)), identifier = "calling-AP-title")]
+        pub calling_ap_title: Option<APTitle>,
+        #[rasn(tag(explicit(context, 7)), identifier = "calling-AE-qualifier")]
+        pub calling_ae_qualifier: Option<AEQualifier>,
+        #[rasn(
+            tag(explicit(context, 8)),
+            identifier = "calling-AP-invocation-identifier"
+        )]
+        pub calling_ap_invocation_identifier: Option<APInvocationIdentifier>,
+        #[rasn(
+            tag(explicit(context, 9)),
+            identifier = "calling-AE-invocation-identifier"
+        )]
+        pub calling_ae_invocation_identifier: Option<AEInvocationIdentifier>,
         #[rasn(tag(context, 10), identifier = "sender-acse-requirements")]
         pub sender_acse_requirements: Option<ACSERequirements>,
         #[rasn(tag(context, 11), identifier = "mechanism-name")]
@@ -132,16 +146,16 @@ pub mod acse_1 {
     }
     impl AARQApdu {
         pub fn new(
-            protocol_version: BitString,
-            a_so_context_name: ASOContextName,
-            called__ap_title: Option<APTitle>,
-            called__ae_qualifier: Option<AEQualifier>,
-            called__ap_invocation_identifier: Option<APInvocationIdentifier>,
-            called__ae_invocation_identifier: Option<AEInvocationIdentifier>,
-            calling__ap_title: Option<APTitle>,
-            calling__ae_qualifier: Option<AEQualifier>,
-            calling__ap_invocation_identifier: Option<APInvocationIdentifier>,
-            calling__ae_invocation_identifier: Option<AEInvocationIdentifier>,
+            protocol_version: Option<BitString>,
+            application_context_name: ObjectIdentifier,
+            called_ap_title: Option<APTitle>,
+            called_ae_qualifier: Option<AEQualifier>,
+            called_ap_invocation_identifier: Option<APInvocationIdentifier>,
+            called_ae_invocation_identifier: Option<AEInvocationIdentifier>,
+            calling_ap_title: Option<APTitle>,
+            calling_ae_qualifier: Option<AEQualifier>,
+            calling_ap_invocation_identifier: Option<APInvocationIdentifier>,
+            calling_ae_invocation_identifier: Option<AEInvocationIdentifier>,
             sender_acse_requirements: Option<ACSERequirements>,
             mechanism_name: Option<MechanismName>,
             calling_authentication_value: Option<AuthenticationValue>,
@@ -151,15 +165,15 @@ pub mod acse_1 {
         ) -> Self {
             Self {
                 protocol_version,
-                a_so_context_name,
-                called__ap_title,
-                called__ae_qualifier,
-                called__ap_invocation_identifier,
-                called__ae_invocation_identifier,
-                calling__ap_title,
-                calling__ae_qualifier,
-                calling__ap_invocation_identifier,
-                calling__ae_invocation_identifier,
+                application_context_name,
+                called_ap_title,
+                called_ae_qualifier,
+                called_ap_invocation_identifier,
+                called_ae_invocation_identifier,
+                calling_ap_title,
+                calling_ae_qualifier,
+                calling_ap_invocation_identifier,
+                calling_ae_invocation_identifier,
                 sender_acse_requirements,
                 mechanism_name,
                 calling_authentication_value,
@@ -168,9 +182,6 @@ pub mod acse_1 {
                 user_information,
             }
         }
-    }
-    fn aarqapdu_protocol_version_default() -> BitString {
-        [true].into_iter().collect()
     }
     #[doc = "  may be used to identify the Association Control ASE."]
     #[doc = "  top level CHOICE"]
@@ -277,7 +288,7 @@ pub mod acse_1 {
     #[rasn(delegate, identifier = "ASO-qualifier-form2")]
     pub struct ASOQualifierForm2(pub Integer);
     #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
-    #[rasn(delegate, value("0..=2", extensible), identifier = "Associate-result")]
+    #[rasn(delegate, identifier = "Associate-result", value("0..=2", extensible))]
     pub struct AssociateResult(pub Integer);
     #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
     #[rasn(choice, identifier = "Associate-source-diagnostic")]
@@ -498,6 +509,18 @@ pub mod acse_1 {
     #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
     #[rasn(delegate, identifier = "Simply-encoded-data")]
     pub struct SimplyEncodedData(pub OctetString);
-    lazy_static! { # [doc = "  may be used to reference the abstract syntax of the ACSE APDUs."] pub static ref A_CSE_ID : ObjectIdentifier = Oid :: const_new (& [2u32 , 3u32 , 1u32 , 1u32]) . to_owned () ; }
-    lazy_static! { # [doc = " IMPORTS"] # [doc = "   Name, RelativeDistinguishedName"] # [doc = "     FROM InformationFramework {joint-iso-itu-t ds(5) module(1)"] # [doc = "       informationFramework(1) 3};"] # [doc = " EXPORTS"] # [doc = "   acse-as-id, ACSE-apdu, aCSE-id, ASO-context-name, AP_title,"] # [doc = "     AE_qualifier, AE_title, AP_invocation_identifier, AE_invocation_identifier,"] # [doc = "     Mechanism_name, Authentication_value, ACSE_requirements, ObjectSet;"] # [doc = "  object identifier assignments"] pub static ref ACSE_AS_ID : ObjectIdentifier = Oid :: const_new (& [2u32 , 1u32 , 0u32 , 1u32]) . to_owned () ; }
+    #[doc = "  may be used to reference the abstract syntax of the ACSE APDUs."]
+    pub static A_CSE_ID: LazyLock<ObjectIdentifier> =
+        LazyLock::new(|| Oid::const_new(&[2u32, 2u32, 3u32, 1u32, 1u32]).to_owned());
+    #[doc = " IMPORTS"]
+    #[doc = "   Name, RelativeDistinguishedName"]
+    #[doc = "     FROM InformationFramework { joint-iso-itu-t ds(5) module(1)"]
+    #[doc = "       informationFramework(1) 3 } ;"]
+    #[doc = " EXPORTS"]
+    #[doc = "   acse-as-id, ACSE-apdu, aCSE-id, ASO-context-name, AP_title,"]
+    #[doc = "     AE_qualifier, AE_title, AP_invocation_identifier, AE_invocation_identifier,"]
+    #[doc = "     Mechanism_name, Authentication_value, ACSE_requirements, ObjectSet;"]
+    #[doc = "  object identifier assignments"]
+    pub static ACSE_AS_ID: LazyLock<ObjectIdentifier> =
+        LazyLock::new(|| Oid::const_new(&[2u32, 2u32, 1u32, 0u32, 1u32]).to_owned());
 }

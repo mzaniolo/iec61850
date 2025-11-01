@@ -1,10 +1,11 @@
 //! ISO Session Layer Implementation (ISO 8327)
 
-use snafu::{OptionExt as _, ResultExt as _, Snafu};
+use snafu::{OptionExt as _, Snafu};
+use tracing::instrument;
 
 use crate::mms::{
-    SpanTraceWrapper,
-    cotp::{self, ClientConfig, CotpConnection},
+    ClientConfig, SpanTraceWrapper,
+    cotp::{self, CotpConnection},
 };
 
 /// Maximum size for session selectors (S-SEL)
@@ -19,13 +20,14 @@ pub struct Session {
 
 impl Session {
     pub async fn new(config: &ClientConfig) -> Result<Self, SessionError> {
-        let cotp_connection = CotpConnection::connect(config).await.context(ConnectCotp)?;
+        let cotp_connection = CotpConnection::connect(config).await?;
         Ok(Self {
             cotp_connection,
             local_s_sel: SSelector::from_bytes(&config.local_s_sel)?,
             remote_s_sel: SSelector::from_bytes(&config.remote_s_sel)?,
         })
     }
+    #[instrument(skip(self))]
     pub async fn connect(&mut self, data: &[u8]) -> Result<Vec<u8>, SessionError> {
         let spdu = ConnectSpdu::new(
             self.local_s_sel.clone(),
@@ -34,17 +36,8 @@ impl Session {
             data.to_vec(),
         );
         let spdu_bytes = spdu.to_bytes();
-        println!("Sending CONNECT SPDU: {:?}", spdu_bytes);
-        self.cotp_connection
-            .send_data(&spdu_bytes)
-            .await
-            .context(CotpSendData)?;
-        println!("Waiting for response...");
-        let response = self
-            .cotp_connection
-            .receive_data()
-            .await
-            .context(CotpReceiveData)?;
+        self.cotp_connection.send_data(&spdu_bytes).await?;
+        let response = self.cotp_connection.receive_data().await?;
         let response_spdu = Spdu::from_bytes(&response)?;
         if let Spdu::Accept(accept_spdu) = response_spdu {
             Ok(accept_spdu.data)
@@ -52,21 +45,16 @@ impl Session {
             InvalidCotpResponse.fail()
         }
     }
+    #[instrument(skip(self))]
     pub async fn send_data(&mut self, data: &[u8]) -> Result<(), SessionError> {
         let spdu = DataSpdu::new(data.to_vec());
         let spdu_bytes = spdu.to_bytes();
-        self.cotp_connection
-            .send_data(&spdu_bytes)
-            .await
-            .context(CotpSendData)?;
+        self.cotp_connection.send_data(&spdu_bytes).await?;
         Ok(())
     }
+    #[instrument(skip(self))]
     pub async fn receive_data(&mut self) -> Result<Vec<u8>, SessionError> {
-        let response = self
-            .cotp_connection
-            .receive_data()
-            .await
-            .context(CotpReceiveData)?;
+        let response = self.cotp_connection.receive_data().await?;
         let response_spdu = Spdu::from_bytes(&response)?;
         if let Spdu::Data(data_spdu) = response_spdu {
             Ok(data_spdu.data)
@@ -141,6 +129,9 @@ impl SSelector {
     }
     pub fn len(&self) -> usize {
         self.value.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.value.is_empty()
     }
 }
 
@@ -271,6 +262,7 @@ pub enum Spdu {
 
 impl Spdu {
     /// Parse SPDU from bytes
+    #[instrument(skip_all)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
         let length = *bytes.get(1).context(NotEnoughBytes)? as usize;
 
@@ -325,8 +317,8 @@ impl Spdu {
 /// CONNECT SPDU
 #[derive(Debug, Clone)]
 pub struct ConnectSpdu {
-    pub calling_session_selector: SSelector,
-    pub called_session_selector: SSelector,
+    pub calling_session_selector: Option<SSelector>,
+    pub called_session_selector: Option<SSelector>,
     pub session_requirement: SessionRequirement,
     pub protocol_options: u8,
     pub data: Vec<u8>,
@@ -340,8 +332,8 @@ impl ConnectSpdu {
         data: Vec<u8>,
     ) -> Self {
         Self {
-            calling_session_selector: calling,
-            called_session_selector: called,
+            calling_session_selector: Some(calling),
+            called_session_selector: Some(called),
             session_requirement: requirement,
             protocol_options: 0,
             data,
@@ -418,12 +410,11 @@ impl ConnectSpdu {
         }
 
         Ok(Self {
-            calling_session_selector: calling_session_selector
-                .context(MissingRequiredParameters)?,
-            called_session_selector: called_session_selector.context(MissingRequiredParameters)?,
-            session_requirement: session_requirement.context(MissingRequiredParameters)?,
-            protocol_options: protocol_options.context(MissingRequiredParameters)?,
-            data: user_data.context(MissingRequiredParameters)?,
+            calling_session_selector,
+            called_session_selector,
+            session_requirement: session_requirement.context(MissingSessionRequirement)?,
+            protocol_options: protocol_options.context(MissingProtocolOptions)?,
+            data: user_data.context(MissingUserData)?,
         })
     }
 
@@ -521,6 +512,11 @@ impl ConnectSpdu {
         if has_protocol_options && has_protocol_version {
             Ok(protocol_options)
         } else {
+            tracing::debug!(
+                "Missing required parameters. has_protocol_options: {}, has_protocol_version: {}",
+                has_protocol_options,
+                has_protocol_version
+            );
             MissingRequiredParameters.fail()
         }
     }
@@ -543,20 +539,24 @@ impl ConnectSpdu {
     }
 
     fn encode_calling_session_selector(&self, buffer: &mut Vec<u8>) {
-        buffer.push(Pgi::CallingSessionSelector as u8);
-        buffer.extend_from_slice(&self.calling_session_selector.to_bytes());
+        if let Some(calling_session_selector) = &self.calling_session_selector {
+            buffer.push(Pgi::CallingSessionSelector as u8);
+            buffer.extend_from_slice(&calling_session_selector.to_bytes());
+        }
     }
 
     fn encode_called_session_selector(&self, buffer: &mut Vec<u8>) {
-        buffer.push(Pgi::CalledSessionSelector as u8);
-        buffer.extend_from_slice(&self.called_session_selector.to_bytes());
+        if let Some(called_session_selector) = &self.called_session_selector {
+            buffer.push(Pgi::CalledSessionSelector as u8);
+            buffer.extend_from_slice(&called_session_selector.to_bytes());
+        }
     }
 }
 
 /// ACCEPT SPDU
 #[derive(Debug, Clone)]
 pub struct AcceptSpdu {
-    pub called_session_selector: SSelector,
+    pub called_session_selector: Option<SSelector>,
     pub session_requirement: SessionRequirement,
     pub protocol_options: u8,
     pub data: Vec<u8>,
@@ -570,13 +570,13 @@ impl AcceptSpdu {
         data: Vec<u8>,
     ) -> Self {
         Self {
-            called_session_selector: called,
+            called_session_selector: Some(called),
             session_requirement: requirement,
             protocol_options,
             data,
         }
     }
-
+    #[instrument(skip_all)]
     fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
         let connect_spdu = ConnectSpdu::from_bytes(bytes)?;
         Ok(Self {
@@ -610,8 +610,10 @@ impl AcceptSpdu {
         buffer.extend_from_slice(&(self.session_requirement as u16).to_le_bytes());
 
         // Called Session Selector
-        buffer.push(Pgi::CalledSessionSelector as u8);
-        buffer.extend_from_slice(&self.called_session_selector.to_bytes());
+        if let Some(called_session_selector) = &self.called_session_selector {
+            buffer.push(Pgi::CalledSessionSelector as u8);
+            buffer.extend_from_slice(&called_session_selector.to_bytes());
+        }
 
         // User Data
         buffer.push(Pgi::UserData as u8);
@@ -821,26 +823,39 @@ impl RefuseSpdu {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum SessionError {
-    #[snafu(display("Error sending data to COTP"))]
-    CotpSendData {
-        source: cotp::Error,
+    #[snafu(display("Missing calling session selector"))]
+    MissingCallingSessionSelector {
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
-    #[snafu(display("Error receiving data from COTP"))]
-    CotpReceiveData {
-        source: cotp::Error,
+    #[snafu(display("Missing called session selector"))]
+    MissingCalledSessionSelector {
+        #[snafu(implicit)]
+        context: Box<SpanTraceWrapper>,
+    },
+    #[snafu(display("Missing session requirement"))]
+    MissingSessionRequirement {
+        #[snafu(implicit)]
+        context: Box<SpanTraceWrapper>,
+    },
+    #[snafu(display("Missing protocol options"))]
+    MissingProtocolOptions {
+        #[snafu(implicit)]
+        context: Box<SpanTraceWrapper>,
+    },
+    #[snafu(display("Missing user data"))]
+    MissingUserData {
+        #[snafu(implicit)]
+        context: Box<SpanTraceWrapper>,
+    },
+    #[snafu(display("Error in COTP layer"))]
+    CotpLayer {
+        source: cotp::CotpError,
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
     #[snafu(display("Invalid response from COTP"))]
     InvalidCotpResponse {
-        #[snafu(implicit)]
-        context: Box<SpanTraceWrapper>,
-    },
-    #[snafu(display("Error connecting to COTP"))]
-    ConnectCotp {
-        source: cotp::Error,
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
@@ -925,6 +940,44 @@ pub enum SessionError {
     },
 }
 
+impl SessionError {
+    pub fn get_context(&self) -> &SpanTraceWrapper {
+        match self {
+            SessionError::CotpLayer { context, .. } => context,
+            SessionError::InvalidCotpResponse { context, .. } => context,
+            SessionError::NotEnoughBytes { context } => context,
+            SessionError::InvalidVersion { context, .. } => context,
+            SessionError::MissingRequiredParameters { context } => context,
+            SessionError::PayloadTooLarge { context } => context,
+            SessionError::InvalidSessionRequirement { context, .. } => context,
+            SessionError::InvalidParameter { context, .. } => context,
+            SessionError::InvalidSpduType { context, .. } => context,
+            SessionError::MessageTooShort { context } => context,
+            SessionError::InvalidLength { context } => context,
+            SessionError::InvalidDataSpdu { context } => context,
+            SessionError::ConnectionRefused { context } => context,
+            SessionError::UnexpectedEndOfMessage { context } => context,
+            SessionError::InvalidParameterLength { context } => context,
+            SessionError::InvalidSelectorSize { context } => context,
+            SessionError::NoUserData { context } => context,
+            SessionError::MissingCallingSessionSelector { context } => context,
+            SessionError::MissingCalledSessionSelector { context } => context,
+            SessionError::MissingSessionRequirement { context } => context,
+            SessionError::MissingProtocolOptions { context } => context,
+            SessionError::MissingUserData { context } => context,
+        }
+    }
+}
+
+impl From<cotp::CotpError> for SessionError {
+    fn from(error: cotp::CotpError) -> Self {
+        SessionError::CotpLayer {
+            context: Box::new((*error.get_context()).clone()),
+            source: error,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,8 +1023,8 @@ mod tests {
         let bytes = spdu.to_bytes();
 
         let parsed = ConnectSpdu::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed.calling_session_selector, calling);
-        assert_eq!(parsed.called_session_selector, called);
+        assert_eq!(parsed.calling_session_selector, Some(calling));
+        assert_eq!(parsed.called_session_selector, Some(called));
         assert_eq!(parsed.session_requirement, requirement);
         assert_eq!(parsed.data, user_data);
     }
