@@ -1,10 +1,11 @@
+use async_trait::async_trait;
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
 use tracing::instrument;
 
 use crate::mms::{
-    ClientConfig, SpanTraceWrapper,
+    ClientConfig, ReadHalfConnection, SpanTraceWrapper, WriteHalfConnection,
     ans1::acse::acse_1::*,
-    presentation::{Presentation, PresentationError},
+    presentation::{Presentation, PresentationError, PresentationReadHalf, PresentationWriteHalf},
 };
 use rasn::{ber, prelude::*};
 
@@ -66,7 +67,7 @@ impl Acse {
         );
 
         //TODO: Handle context id
-        let (data, context_id) = self
+        let (data, _context_id) = self
             .presentation
             .connect(ber::encode(&aarq).context(EncodeAarq)?)
             .await?;
@@ -88,16 +89,79 @@ impl Acse {
         }
     }
 
-    #[instrument(skip(self))]
-    pub async fn send_data(&mut self, data: Vec<u8>) -> Result<(), AcseError> {
-        Ok(self.presentation.send_data(data).await?)
+    pub fn split(self) -> (AcseReadHalf, AcseWriteHalf) {
+        let (presentation_read, presentation_write) = self.presentation.split();
+        (
+            AcseReadHalf {
+                presentation: presentation_read,
+            },
+            AcseWriteHalf {
+                presentation: presentation_write,
+            },
+        )
     }
+}
 
+#[async_trait]
+impl WriteHalfConnection for Acse {
+    type Error = AcseError;
     #[instrument(skip(self))]
-    pub async fn receive_data(&mut self) -> Result<Vec<u8>, AcseError> {
-        let (data, context_id) = self.presentation.receive_data().await?;
-        //TODO: Handle context id
-        Ok(data)
+    async fn send_data(&mut self, data: Vec<u8>) -> Result<(), Self::Error> {
+        AcseWriteHalf::send_data_internal(&mut self.presentation, data).await
+    }
+}
+
+#[async_trait]
+impl ReadHalfConnection for Acse {
+    type Error = AcseError;
+    #[instrument(skip(self))]
+    async fn receive_data(&mut self) -> Result<Vec<u8>, Self::Error> {
+        AcseReadHalf::receive_data_internal(&mut self.presentation).await
+    }
+}
+
+pub struct AcseWriteHalf {
+    presentation: PresentationWriteHalf,
+}
+
+impl AcseWriteHalf {
+    #[instrument(skip_all)]
+    async fn send_data_internal<W: WriteHalfConnection<Error = PresentationError>>(
+        presentation: &mut W,
+        data: Vec<u8>,
+    ) -> Result<(), AcseError> {
+        Ok(presentation.send_data(data).await?)
+    }
+}
+
+#[async_trait]
+impl WriteHalfConnection for AcseWriteHalf {
+    type Error = AcseError;
+    #[instrument(skip(self))]
+    async fn send_data(&mut self, data: Vec<u8>) -> Result<(), Self::Error> {
+        Self::send_data_internal(&mut self.presentation, data).await
+    }
+}
+
+pub struct AcseReadHalf {
+    presentation: PresentationReadHalf,
+}
+
+impl AcseReadHalf {
+    #[instrument(skip_all)]
+    async fn receive_data_internal<R: ReadHalfConnection<Error = PresentationError>>(
+        presentation: &mut R,
+    ) -> Result<Vec<u8>, AcseError> {
+        Ok(presentation.receive_data().await?)
+    }
+}
+
+#[async_trait]
+impl ReadHalfConnection for AcseReadHalf {
+    type Error = AcseError;
+    #[instrument(skip(self))]
+    async fn receive_data(&mut self) -> Result<Vec<u8>, Self::Error> {
+        Self::receive_data_internal(&mut self.presentation).await
     }
 }
 

@@ -1,8 +1,9 @@
 use std::pin::Pin;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use snafu::{OptionExt as _, ResultExt as _, Snafu, whatever};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio_native_tls::{
     TlsConnector, TlsStream,
@@ -10,7 +11,9 @@ use tokio_native_tls::{
 };
 use tracing::instrument;
 
-use crate::mms::{ClientConfig, SpanTraceWrapper, TlsClientConfig};
+use crate::mms::{
+    ClientConfig, ReadHalfConnection, SpanTraceWrapper, TlsClientConfig, WriteHalfConnection,
+};
 
 pub(super) const TPKT_VERSION: u8 = 0x03;
 pub(super) const COTP_MAX_TPDU_SIZE: u32 = 8192;
@@ -19,8 +22,8 @@ pub(super) const TPKT_HEADER_SIZE: usize = 4;
 
 #[derive(Debug)]
 pub struct CotpConnection {
-    connection: Connection,
-    tpdu_size: u32,
+    read_connection: CotpReadHalf,
+    write_connection: CotpWriteHalf,
 }
 
 impl CotpConnection {
@@ -52,58 +55,76 @@ impl CotpConnection {
             .await
             .whatever_context("Error writing to connection")?;
 
-        let tpkt = Self::read_tpkt(&mut connection).await?;
+        let tpkt = CotpReadHalf::read_tpkt(&mut connection).await?;
 
         if !matches!(tpkt.cotp, Cotp::Cc(_)) {
             return WrongCotpType.fail();
         }
+
         if let Cotp::Cc(cc_tpdu) = &tpkt.cotp
             && cc_tpdu.dst_ref == local_ref
         {
+            let tpdu_size = cc_tpdu
+                .options
+                .iter()
+                .find_map(|option| {
+                    if let CotpOptions::TpduSize(tpdu_size) = option {
+                        Some(tpdu_size.get_value())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(COTP_MAX_TPDU_SIZE);
+            let (read_half, write_half) = tokio::io::split(connection);
             return Ok(Self {
-                connection,
-                tpdu_size: cc_tpdu
-                    .options
-                    .iter()
-                    .find_map(|option| {
-                        if let CotpOptions::TpduSize(tpdu_size) = option {
-                            Some(tpdu_size.get_value())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(COTP_MAX_TPDU_SIZE),
+                read_connection: CotpReadHalf {
+                    connection: read_half,
+                },
+                write_connection: CotpWriteHalf {
+                    connection: write_half,
+                    tpdu_size,
+                },
             });
         }
 
         ConnectionFailed.fail()
     }
-    #[instrument(skip(self))]
-    pub async fn send_data(&mut self, data: &[u8]) -> Result<(), CotpError> {
-        let max_dt_data_size = self.tpdu_size as usize - COTP_DT_HEADER_SIZE;
-        let num_dts = data.len().div_ceil(max_dt_data_size);
-        let buffer_size = num_dts * (TPKT_HEADER_SIZE + COTP_DT_HEADER_SIZE) + data.len();
-        let mut buffer = Vec::with_capacity(buffer_size);
-        for (i, chunk) in data.chunks(max_dt_data_size).enumerate() {
-            let eot = if i == num_dts - 1 {
-                Eot::Eot
-            } else {
-                Eot::NoEot
-            };
-            let dt_tpdu = Cotp::Dt(DtTpdu::new(eot, chunk.to_vec()));
-            //TODO: This needs to be optimized
-            buffer.extend_from_slice(&Tpkt::from_cotp(dt_tpdu).to_bytes());
-        }
-
-        self.connection
-            .write_all(&buffer)
-            .await
-            .whatever_context("Error writing to connection")?;
-
-        Ok(())
+    pub fn split(self) -> (CotpReadHalf, CotpWriteHalf) {
+        (self.read_connection, self.write_connection)
     }
+}
+
+#[async_trait]
+impl ReadHalfConnection for CotpConnection {
+    type Error = CotpError;
+
     #[instrument(skip(self))]
-    pub async fn receive_data(&mut self) -> Result<Vec<u8>, CotpError> {
+    async fn receive_data(&mut self) -> Result<Vec<u8>, Self::Error> {
+        self.read_connection.receive_data().await
+    }
+}
+
+#[async_trait]
+impl WriteHalfConnection for CotpConnection {
+    type Error = CotpError;
+
+    #[instrument(skip(self))]
+    async fn send_data(&mut self, data: Vec<u8>) -> Result<(), Self::Error> {
+        self.write_connection.send_data(data).await
+    }
+}
+
+#[derive(Debug)]
+pub struct CotpReadHalf {
+    connection: ReadHalf<Connection>,
+}
+
+#[async_trait]
+impl ReadHalfConnection for CotpReadHalf {
+    type Error = CotpError;
+
+    #[instrument(skip(self))]
+    async fn receive_data(&mut self) -> Result<Vec<u8>, Self::Error> {
         let mut data = Vec::new();
         loop {
             match Self::read_tpkt(&mut self.connection).await {
@@ -117,16 +138,18 @@ impl CotpConnection {
                     _ => return WrongCotpType.fail(),
                 },
                 Err(e) => {
-                    println!("Error reading TPKT: {:?}", e);
+                    tracing::error!("Error reading TPKT: {:?}", e);
                     return Err(e);
                 }
             }
         }
         Ok(data)
     }
+}
 
+impl CotpReadHalf {
     #[instrument(skip(connection))]
-    async fn read_tpkt(connection: &mut Connection) -> Result<Tpkt, CotpError> {
+    async fn read_tpkt<R: AsyncRead + Unpin>(connection: &mut R) -> Result<Tpkt, CotpError> {
         let mut buffer = [0; TPKT_HEADER_SIZE];
         connection
             .read_exact(&mut buffer)
@@ -151,6 +174,41 @@ impl CotpConnection {
         let cotp = Cotp::from_bytes(&buffer)?;
 
         Ok(Tpkt::from_cotp(cotp))
+    }
+}
+
+#[derive(Debug)]
+pub struct CotpWriteHalf {
+    connection: WriteHalf<Connection>,
+    tpdu_size: u32,
+}
+
+#[async_trait]
+impl WriteHalfConnection for CotpWriteHalf {
+    type Error = CotpError;
+    #[instrument(skip(self))]
+    async fn send_data(&mut self, data: Vec<u8>) -> std::result::Result<(), Self::Error> {
+        let max_dt_data_size = self.tpdu_size as usize - COTP_DT_HEADER_SIZE;
+        let num_dts = data.len().div_ceil(max_dt_data_size);
+        let buffer_size = num_dts * (TPKT_HEADER_SIZE + COTP_DT_HEADER_SIZE) + data.len();
+        let mut buffer = Vec::with_capacity(buffer_size);
+        for (i, chunk) in data.chunks(max_dt_data_size).enumerate() {
+            let eot = if i == num_dts - 1 {
+                Eot::Eot
+            } else {
+                Eot::NoEot
+            };
+            let dt_tpdu = Cotp::Dt(DtTpdu::new(eot, chunk.to_vec()));
+            //TODO: This needs to be optimized
+            buffer.extend_from_slice(&Tpkt::from_cotp(dt_tpdu).to_bytes());
+        }
+
+        self.connection
+            .write_all(&buffer)
+            .await
+            .whatever_context("Error writing to connection")?;
+
+        Ok(())
     }
 }
 
@@ -318,6 +376,7 @@ struct CcTpdu {
 }
 
 impl CcTpdu {
+    #[allow(dead_code)]
     fn new(dst_ref: u16, src_ref: u16, options: Vec<CotpOptions>) -> Self {
         Self {
             li: (options.iter().map(|option| option.len()).sum::<usize>() + 6) as u8,
@@ -530,11 +589,8 @@ impl TpduSize {
     pub fn get_value(&self) -> u32 {
         1 << self.value
     }
-    pub fn set_value(&mut self, value: u32) {
-        self.value = Self::calculate_value(value);
-    }
     fn calculate_value(mut value: u32) -> u8 {
-        if value > COTP_MAX_TPDU_SIZE || value < 1 {
+        if !(1..=COTP_MAX_TPDU_SIZE).contains(&value) {
             value = COTP_MAX_TPDU_SIZE;
         }
         value.ilog2() as u8

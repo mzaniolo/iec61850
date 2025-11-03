@@ -1,5 +1,6 @@
 use std::{fmt, path::PathBuf};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
@@ -123,4 +124,16 @@ pub enum Error {
         #[snafu(implicit)]
         context: Box<SpanTraceWrapper>,
     },
+}
+
+#[async_trait]
+trait ReadHalfConnection {
+    type Error: std::error::Error + Send + Sync;
+    async fn receive_data(&mut self) -> std::result::Result<Vec<u8>, Self::Error>;
+}
+
+#[async_trait]
+trait WriteHalfConnection {
+    type Error: std::error::Error + Send + Sync;
+    async fn send_data(&mut self, data: Vec<u8>) -> std::result::Result<(), Self::Error>;
 }

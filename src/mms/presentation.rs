@@ -1,10 +1,16 @@
 //! ISO Presentation Layer Implementation (ISO 8327)
 
+use async_trait::async_trait;
+use lazy_static::lazy_static;
 use rasn::{ber, prelude::*};
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
 use tracing::instrument;
 
-use crate::mms::{ClientConfig, SpanTraceWrapper, ans1::presentation::asn1::*, session::Session};
+use crate::mms::{
+    ClientConfig, ReadHalfConnection, SpanTraceWrapper, WriteHalfConnection,
+    ans1::presentation::asn1::*,
+    session::{Session, SessionError, SessionReadHalf, SessionWriteHalf},
+};
 
 const ACSE_OID: [u32; 5] = [2, 2, 1, 0, 1];
 const MMS_OID: [u32; 5] = [1, 0, 9506, 2, 1];
@@ -12,6 +18,36 @@ const BER_OID: [u32; 3] = [2, 1, 1];
 
 const ACSE_CONTEXT_ID: u64 = 1;
 const MMS_CONTEXT_ID: u64 = 3;
+
+lazy_static! {
+    static ref BER_OID_OBJECT_IDENTIFIER: ObjectIdentifier =
+        ObjectIdentifier::new(&BER_OID).expect("BER OID is valid");
+    static ref ACSE_OID_OBJECT_IDENTIFIER: ObjectIdentifier =
+        ObjectIdentifier::new(&ACSE_OID).expect("ACSE OID is valid");
+    static ref MMS_OID_OBJECT_IDENTIFIER: ObjectIdentifier =
+        ObjectIdentifier::new(&MMS_OID).expect("MMS OID is valid");
+    static ref PRESENTATION_CONTEXT_DEFINITION_LIST: PresentationContextDefinitionList =
+        PresentationContextDefinitionList(ContextList(vec![
+            AnonymousContextList {
+                presentation_context_identifier: PresentationContextIdentifier(Integer::from(
+                    ACSE_CONTEXT_ID,
+                )),
+                abstract_syntax_name: AbstractSyntaxName(ACSE_OID_OBJECT_IDENTIFIER.clone()),
+                transfer_syntax_name_list: vec![TransferSyntaxName(
+                    BER_OID_OBJECT_IDENTIFIER.clone()
+                )],
+            },
+            AnonymousContextList {
+                presentation_context_identifier: PresentationContextIdentifier(Integer::from(
+                    MMS_CONTEXT_ID,
+                )),
+                abstract_syntax_name: AbstractSyntaxName(MMS_OID_OBJECT_IDENTIFIER.clone()),
+                transfer_syntax_name_list: vec![TransferSyntaxName(
+                    BER_OID_OBJECT_IDENTIFIER.clone()
+                )],
+            },
+        ]));
+}
 
 #[derive(Debug)]
 pub struct Presentation {
@@ -38,51 +74,7 @@ impl Presentation {
         &mut self,
         data: Vec<u8>,
     ) -> std::result::Result<(Vec<u8>, u64), PresentationError> {
-        let presentation_context_definition_list =
-            PresentationContextDefinitionList(ContextList(vec![
-                AnonymousContextList {
-                    presentation_context_identifier: PresentationContextIdentifier(Integer::from(
-                        ACSE_CONTEXT_ID,
-                    )),
-                    abstract_syntax_name: AbstractSyntaxName(
-                        ObjectIdentifier::new(&ACSE_OID).context(CreateObjectIdentifier)?,
-                    ),
-                    transfer_syntax_name_list: vec![TransferSyntaxName(
-                        ObjectIdentifier::new(&BER_OID).context(CreateObjectIdentifier)?,
-                    )],
-                },
-                AnonymousContextList {
-                    presentation_context_identifier: PresentationContextIdentifier(Integer::from(
-                        MMS_CONTEXT_ID,
-                    )),
-                    abstract_syntax_name: AbstractSyntaxName(
-                        ObjectIdentifier::new(&MMS_OID).context(CreateObjectIdentifier)?,
-                    ),
-                    transfer_syntax_name_list: vec![TransferSyntaxName(
-                        ObjectIdentifier::new(&BER_OID).context(CreateObjectIdentifier)?,
-                    )],
-                },
-            ]));
-
-        let p_context_id = PresentationContextIdentifier(Integer::from(1));
-        let p_data_values = PDVListPresentationDataValues::from(Any::from(data));
-        let p_list = PDVList::new(None, p_context_id, p_data_values);
-        let p_data = FullyEncodedData(vec![p_list]);
-
-        let normal_mode_params = CPTypeNormalModeParameters::new(
-            ProtocolVersion([true].into_iter().collect()),
-            Some(self.local_p_sel.clone()),
-            Some(self.remote_p_sel.clone()),
-            Some(presentation_context_definition_list),
-            None,
-            None,
-            None,
-            Some(UserData::fully_encoded_data(p_data)),
-        );
-        let cp = CPType::new(
-            ModeSelector::new(Integer::from(1)),
-            Some(normal_mode_params),
-        );
+        let cp = Self::make_cp_ppdu(self.local_p_sel.clone(), self.remote_p_sel.clone(), data);
         let cp_bytes = ber::encode(&cp).context(EncodeCp)?;
         let response = self.session.connect(&cp_bytes).await?;
         let cpa: CPAPPDU = ber::decode(&response).context(DecodeCpa)?;
@@ -114,9 +106,121 @@ impl Presentation {
             _ => UnsupportedPresentationDataValues.fail(),
         }
     }
+    pub fn split(self) -> (PresentationReadHalf, PresentationWriteHalf) {
+        let (session_read, session_write) = self.session.split();
+        (
+            PresentationReadHalf {
+                session_connection: session_read,
+            },
+            PresentationWriteHalf {
+                session_connection: session_write,
+            },
+        )
+    }
+    fn make_cp_ppdu(
+        local_p_sel: CallingPresentationSelector,
+        remote_p_sel: CalledPresentationSelector,
+        data: Vec<u8>,
+    ) -> CPType {
+        let p_context_id = PresentationContextIdentifier(Integer::from(1));
+        let p_data_values = PDVListPresentationDataValues::from(Any::from(data));
+        let p_list = PDVList::new(None, p_context_id, p_data_values);
+        let p_data = FullyEncodedData(vec![p_list]);
+
+        let normal_mode_params = CPTypeNormalModeParameters::new(
+            ProtocolVersion([true].into_iter().collect()),
+            Some(local_p_sel),
+            Some(remote_p_sel),
+            Some(PRESENTATION_CONTEXT_DEFINITION_LIST.clone()),
+            None,
+            None,
+            None,
+            Some(UserData::fully_encoded_data(p_data)),
+        );
+        CPType::new(
+            ModeSelector::new(Integer::from(1)),
+            Some(normal_mode_params),
+        )
+    }
+}
+
+#[async_trait]
+impl WriteHalfConnection for Presentation {
+    type Error = PresentationError;
+
     #[instrument(skip(self))]
-    pub async fn receive_data(&mut self) -> std::result::Result<(Vec<u8>, u64), PresentationError> {
-        let data = self.session.receive_data().await?;
+    async fn send_data(&mut self, data: Vec<u8>) -> std::result::Result<(), Self::Error> {
+        PresentationWriteHalf::send_data_internal(&mut self.session, data).await
+    }
+}
+
+#[async_trait]
+impl ReadHalfConnection for Presentation {
+    type Error = PresentationError;
+
+    #[instrument(skip(self))]
+    async fn receive_data(&mut self) -> std::result::Result<Vec<u8>, Self::Error> {
+        PresentationReadHalf::receive_data_internal(&mut self.session)
+            .await
+            .map(|(data, _context_id)| data)
+    }
+}
+
+#[derive(Debug)]
+pub struct PresentationWriteHalf {
+    session_connection: SessionWriteHalf,
+}
+
+#[async_trait]
+impl WriteHalfConnection for PresentationWriteHalf {
+    type Error = PresentationError;
+
+    #[instrument(skip(self))]
+    async fn send_data(&mut self, data: Vec<u8>) -> std::result::Result<(), Self::Error> {
+        Self::send_data_internal(&mut self.session_connection, data).await
+    }
+}
+
+impl PresentationWriteHalf {
+    #[instrument(skip_all)]
+    async fn send_data_internal<T: WriteHalfConnection<Error = SessionError>>(
+        session_connection: &mut T,
+        data: Vec<u8>,
+    ) -> std::result::Result<(), PresentationError> {
+        let data = UserData::fully_encoded_data(FullyEncodedData(vec![PDVList::new(
+            None,
+            PresentationContextIdentifier(Integer::from(MMS_CONTEXT_ID)),
+            PDVListPresentationDataValues::from(Any::from(data.to_vec())),
+        )]));
+        let data = ber::encode(&data).context(EncodeData)?;
+        session_connection.send_data(data).await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct PresentationReadHalf {
+    session_connection: SessionReadHalf,
+}
+
+#[async_trait]
+impl ReadHalfConnection for PresentationReadHalf {
+    type Error = PresentationError;
+
+    #[instrument(skip(self))]
+    async fn receive_data(&mut self) -> std::result::Result<Vec<u8>, Self::Error> {
+        Self::receive_data_internal(&mut self.session_connection)
+            .await
+            .map(|(data, _context_id)| data)
+    }
+}
+
+impl PresentationReadHalf {
+    #[instrument(skip_all)]
+    async fn receive_data_internal<R: ReadHalfConnection<Error = SessionError>>(
+        session_connection: &mut R,
+    ) -> std::result::Result<(Vec<u8>, u64), PresentationError> {
+        let data = session_connection.receive_data().await?;
         let data: UserData = ber::decode(&data).context(DecodeData)?;
         let mut pdvs = match data {
             UserData::fully_encoded_data(data) => data.0,
@@ -146,17 +250,6 @@ impl Presentation {
             }
             _ => UnsupportedPresentationDataValues.fail(),
         }
-    }
-    #[instrument(skip(self))]
-    pub async fn send_data(&mut self, data: Vec<u8>) -> std::result::Result<(), PresentationError> {
-        let data = UserData::fully_encoded_data(FullyEncodedData(vec![PDVList::new(
-            None,
-            PresentationContextIdentifier(Integer::from(MMS_CONTEXT_ID)),
-            PDVListPresentationDataValues::from(Any::from(data)),
-        )]));
-        let data = ber::encode(&data).context(EncodeData)?;
-        self.session.send_data(&data).await?;
-        Ok(())
     }
 }
 

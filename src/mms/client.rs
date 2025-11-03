@@ -2,7 +2,7 @@ use snafu::{ResultExt as _, Snafu};
 use tracing::instrument;
 
 use crate::mms::{
-    ClientConfig, SpanTraceWrapper,
+    ClientConfig, ReadHalfConnection, SpanTraceWrapper, WriteHalfConnection,
     acse::{Acse, AcseError},
     ans1::mms::asn1::*,
 };

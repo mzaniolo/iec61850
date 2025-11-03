@@ -1,11 +1,12 @@
 //! ISO Session Layer Implementation (ISO 8327)
 
+use async_trait::async_trait;
 use snafu::{OptionExt as _, Snafu};
 use tracing::instrument;
 
 use crate::mms::{
-    ClientConfig, SpanTraceWrapper,
-    cotp::{self, CotpConnection},
+    ClientConfig, ReadHalfConnection, SpanTraceWrapper, WriteHalfConnection,
+    cotp::{self, CotpConnection, CotpError, CotpReadHalf, CotpWriteHalf},
 };
 
 /// Maximum size for session selectors (S-SEL)
@@ -36,7 +37,7 @@ impl Session {
             data.to_vec(),
         );
         let spdu_bytes = spdu.to_bytes();
-        self.cotp_connection.send_data(&spdu_bytes).await?;
+        self.cotp_connection.send_data(spdu_bytes).await?;
         let response = self.cotp_connection.receive_data().await?;
         let response_spdu = Spdu::from_bytes(&response)?;
         if let Spdu::Accept(accept_spdu) = response_spdu {
@@ -45,22 +46,89 @@ impl Session {
             InvalidCotpResponse.fail()
         }
     }
+    pub fn split(self) -> (SessionReadHalf, SessionWriteHalf) {
+        let (cotp_read, cotp_write) = self.cotp_connection.split();
+        (
+            SessionReadHalf { cotp_read },
+            SessionWriteHalf { cotp_write },
+        )
+    }
+}
+
+#[async_trait]
+impl WriteHalfConnection for Session {
+    type Error = SessionError;
+
     #[instrument(skip(self))]
-    pub async fn send_data(&mut self, data: &[u8]) -> Result<(), SessionError> {
+    async fn send_data(&mut self, data: Vec<u8>) -> Result<(), Self::Error> {
+        SessionWriteHalf::send_data_internal(&mut self.cotp_connection, data).await
+    }
+}
+#[async_trait]
+impl ReadHalfConnection for Session {
+    type Error = SessionError;
+
+    #[instrument(skip(self))]
+    async fn receive_data(&mut self) -> Result<Vec<u8>, SessionError> {
+        SessionReadHalf::receive_data_internal(&mut self.cotp_connection).await
+    }
+}
+
+#[derive(Debug)]
+pub struct SessionWriteHalf {
+    cotp_write: CotpWriteHalf,
+}
+
+impl SessionWriteHalf {
+    #[instrument(skip_all)]
+    async fn send_data_internal<W: WriteHalfConnection<Error = CotpError>>(
+        cotp_write: &mut W,
+        data: Vec<u8>,
+    ) -> Result<(), SessionError> {
         let spdu = DataSpdu::new(data.to_vec());
         let spdu_bytes = spdu.to_bytes();
-        self.cotp_connection.send_data(&spdu_bytes).await?;
+        cotp_write.send_data(spdu_bytes).await?;
         Ok(())
     }
+}
+
+#[async_trait]
+impl WriteHalfConnection for SessionWriteHalf {
+    type Error = SessionError;
+
     #[instrument(skip(self))]
-    pub async fn receive_data(&mut self) -> Result<Vec<u8>, SessionError> {
-        let response = self.cotp_connection.receive_data().await?;
+    async fn send_data(&mut self, data: Vec<u8>) -> Result<(), SessionError> {
+        SessionWriteHalf::send_data_internal(&mut self.cotp_write, data).await
+    }
+}
+
+#[derive(Debug)]
+pub struct SessionReadHalf {
+    cotp_read: CotpReadHalf,
+}
+
+impl SessionReadHalf {
+    #[instrument(skip_all)]
+    async fn receive_data_internal<R: ReadHalfConnection<Error = CotpError>>(
+        cotp_read: &mut R,
+    ) -> Result<Vec<u8>, SessionError> {
+        let response = cotp_read.receive_data().await?;
         let response_spdu = Spdu::from_bytes(&response)?;
         if let Spdu::Data(data_spdu) = response_spdu {
             Ok(data_spdu.data)
         } else {
             InvalidCotpResponse.fail()
         }
+    }
+}
+
+#[async_trait]
+impl ReadHalfConnection for SessionReadHalf {
+    type Error = SessionError;
+
+    #[instrument(skip(self))]
+    async fn receive_data(&mut self) -> Result<Vec<u8>, SessionError> {
+        Self::receive_data_internal(&mut self.cotp_read).await
     }
 }
 

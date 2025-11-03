@@ -619,6 +619,7 @@ dependencies = [
 name = "iec61850"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "lazy_static",
  "rasn",
  "rasn-compiler",
