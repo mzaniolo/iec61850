@@ -1,5 +1,7 @@
 # IEC 61850
 
+A rust implementation of the IEC61850 protocol
+
 ## Stack
 
 ```mermaid
@@ -46,7 +48,7 @@ TPDU types:
 
 ```mermaid
 ---
-title: CR
+title: "CR"
 ---
 packet
 +8:  "LI"
@@ -59,7 +61,7 @@ packet
 
 ```mermaid
 ---
-title: CC
+title: "CC"
 ---
 packet
 +8:  "LI"
@@ -74,7 +76,7 @@ For CR and CC, the LI is the length of the request discounting the LI itself. So
 
 ```mermaid
 ---
-title: DT
+title: "DT"
 ---
 packet
 +8: "LI - Always 2"
@@ -89,7 +91,7 @@ The size of the data is the TPKT package length - 4 (TPKT header) - 3 (DT TPDU h
 
 ```mermaid
 ---
-title: SPDU Header
+title: "SPDU Header"
 ---
 packet
 +8: "SI"
@@ -110,8 +112,9 @@ SPDU Identifiers
 
 ```mermaid
 ---
-title: Connect SPDU body - Parameter group
+title: "Connect SPDU body - Parameter group"
 ---
+packet
 +8: "PGI Code - 0x05"
 +8: "Lenght of PIs"
 +8: "Protocol options (PI) - 0x13"
@@ -126,6 +129,7 @@ title: Connect SPDU body - Parameter group
 ---
 title: Connect SPDU body - Session req
 ---
+packet
 +8: "PI code - 0x14"
 +8: "Lenght - 0x02"
 +16: "requirements"
@@ -133,8 +137,9 @@ title: Connect SPDU body - Session req
 
 ```mermaid
 ---
-title: Connect SPDU body - Calling session selector
+title: "Connect SPDU body - Calling session selector"
 ---
+packet
 +8: "PI code - 0x33"
 +8: "Lenght - from 0 to 16"
 +16: "selector values"
@@ -176,7 +181,6 @@ asn1 classes def: <https://github.com/beanit/iec61850bean/blob/master/asn1/readm
 asn1 from wireshark: <https://github.com/wireshark/wireshark/blob/master/epan/dissectors/asn1/mms/mms.asn>
 
 <https://sislab.no/MMS_Notat.pdf>
-
 
 | IEC61850 Obj | MMS Obj |
 |--------------|---------|
