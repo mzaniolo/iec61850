@@ -1,61 +1,60 @@
+use std::collections::HashMap;
+
 use snafu::{ResultExt as _, Snafu};
+use tokio::{
+    select,
+    sync::{mpsc, oneshot},
+};
 use tracing::instrument;
 
 use crate::mms::{
     ClientConfig, ReadHalfConnection, SpanTraceWrapper, WriteHalfConnection,
-    acse::{Acse, AcseError},
-    ans1::mms::asn1::*,
+    acse::{Acse, AcseError, AcseReadHalf, AcseWriteHalf},
+    ans1::mms::asn1::{self, *},
 };
 use rasn::{ber, prelude::*};
 
 const VERSION_NUMBER: i16 = 1;
 const MIN_PDU_SIZE: i32 = 64;
+const SERVICE_SUPPORT_OPTIONS: [u8; 11] = [
+    0xee, 0x1c, 0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x79, 0xef, 0x18,
+];
+const PARAMETER_SUPPORT_OPTIONS: [u8; 2] = [0xf1, 0x00];
 
 struct MmsClient {
-    acse: Acse,
     max_serv_outstanding_calling: i16,
     max_serv_outstanding_called: i16,
     data_structure_nesting_level: i8,
     max_pdu_size: i32,
+    tx: mpsc::Sender<(
+        ConfirmedServiceRequest,
+        oneshot::Sender<ConfirmedServiceResponse>,
+    )>,
 }
 
 impl MmsClient {
-    #[instrument(skip(config))]
-    pub async fn new(config: &ClientConfig) -> Result<Self, MmsClientError> {
-        let acse = Acse::new(config).await?;
-        Ok(Self {
-            acse,
-            max_serv_outstanding_calling: config.max_serv_outstanding_calling,
-            max_serv_outstanding_called: config.max_serv_outstanding_called,
-            data_structure_nesting_level: config.data_structure_nesting_level,
-            max_pdu_size: config.max_pdu_size,
-        })
-    }
-    #[instrument(skip(self))]
-    pub async fn connect(&mut self) -> Result<(), MmsClientError> {
-        let mut s = BitString::from_slice(&[
-            0xee, 0x1c, 0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x79, 0xef, 0x18,
-        ]);
-        for _ in 0..3 {
-            s.pop();
-        }
-        let mut cbb = BitString::from_slice(&[0xf1, 0x00]);
-        for _ in 0..5 {
-            cbb.pop();
-        }
+    #[instrument]
+    pub async fn connect(config: &ClientConfig) -> Result<Self, MmsClientError> {
+        let mut acse = Acse::new(config).await?;
+
+        let mut max_serv_outstanding_called = config.max_serv_outstanding_called;
+        let mut max_serv_outstanding_calling = config.max_serv_outstanding_calling;
+        let mut data_structure_nesting_level = config.data_structure_nesting_level;
+        let mut max_pdu_size = config.max_pdu_size;
+
         let request = MMSpdu::initiate_RequestPDU(InitiateRequestPDU::new(
-            Some(Integer32(self.max_pdu_size)),
-            Integer16(self.max_serv_outstanding_calling),
-            Integer16(self.max_serv_outstanding_called),
-            Some(Integer8(self.data_structure_nesting_level)),
+            Some(Integer32(max_pdu_size)),
+            Integer16(max_serv_outstanding_calling),
+            Integer16(max_serv_outstanding_called),
+            Some(Integer8(data_structure_nesting_level)),
             InitiateRequestPDUInitRequestDetail::new(
                 Integer16(VERSION_NUMBER),
-                ParameterSupportOptions(cbb),
-                ServiceSupportOptions(s),
+                ParameterSupportOptions(make_bitstring(&PARAMETER_SUPPORT_OPTIONS, 11)),
+                ServiceSupportOptions(make_bitstring(&SERVICE_SUPPORT_OPTIONS, 85)),
             ),
         ));
         let data = ber::encode(&request).context(EncodeRequest)?;
-        let response = self.acse.connect(data).await?;
+        let response = acse.connect(data).await?;
         let response: MMSpdu = ber::decode(&response).context(DecodeResponse)?;
 
         let MMSpdu::initiate_ResponsePDU(response) = response else {
@@ -72,72 +71,445 @@ impl MmsClient {
         {
             return MinPduSizeExceeded.fail();
         }
-        if response.negotiated_max_serv_outstanding_called.0 > self.max_serv_outstanding_called {
+        if response.negotiated_max_serv_outstanding_called.0 > max_serv_outstanding_called {
             return MaxServOutstandingCalledExceeded.fail();
         }
-        if response.negotiated_max_serv_outstanding_calling.0 > self.max_serv_outstanding_calling {
+        if response.negotiated_max_serv_outstanding_calling.0 > max_serv_outstanding_calling {
             return MaxServOutstandingCallingExceeded.fail();
         }
         if response
             .negotiated_data_structure_nesting_level
             .as_ref()
-            .is_some_and(|level| level.0 > self.data_structure_nesting_level)
+            .is_some_and(|level| level.0 > data_structure_nesting_level)
         {
             return DataStructureNestingLevelExceeded.fail();
         }
 
         // TODO: Check if the services supported by the server are supported by the client
 
-        self.max_serv_outstanding_called = response.negotiated_max_serv_outstanding_called.0;
-        self.max_serv_outstanding_calling = response.negotiated_max_serv_outstanding_calling.0;
+        max_serv_outstanding_called = response.negotiated_max_serv_outstanding_called.0;
+        max_serv_outstanding_calling = response.negotiated_max_serv_outstanding_calling.0;
         if let Some(level) = response.negotiated_data_structure_nesting_level {
-            self.data_structure_nesting_level = level.0;
+            data_structure_nesting_level = level.0;
         }
         if let Some(size) = response.local_detail_called {
-            self.max_pdu_size = size.0;
+            max_pdu_size = size.0;
         }
 
+        let (read_half, write_half) = acse.split();
+        let (tx, rx) = mpsc::channel(100);
+        tokio::spawn(handle_connection(read_half, write_half, rx));
+
+        Ok(Self {
+            tx,
+            max_serv_outstanding_calling,
+            max_serv_outstanding_called,
+            data_structure_nesting_level,
+            max_pdu_size,
+        })
+    }
+
+    async fn send_request(
+        &self,
+        request: ConfirmedServiceRequest,
+    ) -> Result<ConfirmedServiceResponse, MmsClientError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send((request, tx)).await.context(SendRequest)?;
+        rx.await.context(ReceiveResponse)
+    }
+
+    async fn get_name_list(
+        &self,
+        object_class: u8,
+        scope: GetNameListRequestObjectScope,
+    ) -> Result<Vec<String>, MmsClientError> {
+        let mut name_list = Vec::new();
+        let mut continue_after = None;
+        let mut more_follows = true;
+
+        while more_follows {
+            let request = ConfirmedServiceRequest::getNameList(GetNameListRequest::new(
+                ObjectClass::basicObjectClass(object_class.into()),
+                scope.clone(),
+                continue_after.clone(),
+            ));
+
+            let response = self.send_request(request).await?;
+
+            let ConfirmedServiceResponse::getNameList(response) = response else {
+                return UnexpectedServiceResponse.fail();
+            };
+
+            more_follows = response.more_follows;
+            let ids = response.list_of_identifier;
+            continue_after = ids.last().cloned();
+            name_list.extend(ids.into_iter().map(|id| id.0.to_string()));
+        }
+        Ok(name_list)
+    }
+
+    async fn read(
+        &self,
+        variable_access_specification: VariableAccessSpecification,
+        specification_with_result: bool,
+    ) -> Result<Vec<Data>, MmsClientError> {
+        let request = ConfirmedServiceRequest::read(ReadRequest::new(
+            specification_with_result,
+            variable_access_specification,
+        ));
+
+        let response = self.send_request(request).await?;
+        let ConfirmedServiceResponse::read(response) = response else {
+            return UnexpectedServiceResponse.fail();
+        };
+        response
+            .list_of_access_result
+            .into_iter()
+            .map(|result| match result {
+                AccessResult::success(data) => Ok(data),
+                AccessResult::failure(error) => DataAccess { error: error.0 }.fail(),
+            })
+            .collect::<Result<Vec<Data>, MmsClientError>>()
+    }
+
+    async fn write(
+        &self,
+        variable_access_specification: VariableAccessSpecification,
+        list_of_data: Vec<Data>,
+    ) -> Result<(), MmsClientError> {
+        let request = ConfirmedServiceRequest::write(WriteRequest::new(
+            variable_access_specification,
+            list_of_data,
+        ));
+        let response = self.send_request(request).await?;
+        let ConfirmedServiceResponse::write(response) = response else {
+            return UnexpectedServiceResponse.fail();
+        };
+
+        response
+            .0
+            .into_iter()
+            .find_map(|result| match result {
+                AnonymousWriteResponse::success(()) => None,
+                AnonymousWriteResponse::failure(error) => {
+                    Some(DataAccess { error: error.0 }.fail())
+                }
+            })
+            .unwrap_or(Ok(()))
+    }
+
+    async fn get_variable_access_attributes(
+        &self,
+        object_name: ObjectName,
+    ) -> Result<GetVariableAccessAttributesResponse, MmsClientError> {
+        let request = ConfirmedServiceRequest::getVariableAccessAttributes(
+            GetVariableAccessAttributesRequest::name(object_name),
+        );
+        let response = self.send_request(request).await?;
+        let ConfirmedServiceResponse::getVariableAccessAttributes(response) = response else {
+            return UnexpectedServiceResponse.fail();
+        };
+
+        Ok(response)
+    }
+
+    async fn define_named_variable_list(
+        &self,
+        variable_list_name: ObjectName,
+        list_of_variable: Vec<AnonymousVariableDefs>,
+    ) -> Result<(), MmsClientError> {
+        let request = ConfirmedServiceRequest::defineNamedVariableList(
+            DefineNamedVariableListRequest::new(variable_list_name, VariableDefs(list_of_variable)),
+        );
+        let response = self.send_request(request).await?;
+        if matches!(
+            response,
+            ConfirmedServiceResponse::defineNamedVariableList(_)
+        ) {
+            return UnexpectedServiceResponse.fail();
+        };
         Ok(())
     }
 
+    async fn get_named_variable_list_attributes(
+        &self,
+        object_name: ObjectName,
+    ) -> Result<GetNamedVariableListAttributesResponse, MmsClientError> {
+        let request = ConfirmedServiceRequest::getNamedVariableListAttributes(
+            GetNamedVariableListAttributesRequest(object_name),
+        );
+        let response = self.send_request(request).await?;
+        let ConfirmedServiceResponse::getNamedVariableListAttributes(response) = response else {
+            return UnexpectedServiceResponse.fail();
+        };
+        Ok(response)
+    }
+
+    async fn delete_named_variable_list(
+        &self,
+        scope_of_delete: u32,
+        list_of_variable_list_name: Option<Vec<ObjectName>>,
+        domain_name: Option<String>,
+    ) -> Result<DeleteNamedVariableListResponse, MmsClientError> {
+        let request =
+            ConfirmedServiceRequest::deleteNamedVariableList(DeleteNamedVariableListRequest::new(
+                scope_of_delete.into(),
+                list_of_variable_list_name,
+                domain_name
+                    .map(|name| {
+                        VisibleString::from_iso646_bytes(name.as_bytes()).map(asn1::Identifier)
+                    })
+                    .transpose()
+                    .context(VisibleStringConversion)?,
+            ));
+        let response = self.send_request(request).await?;
+        let ConfirmedServiceResponse::deleteNamedVariableList(response) = response else {
+            return UnexpectedServiceResponse.fail();
+        };
+        Ok(response)
+    }
+
+    async fn file_open(
+        &self,
+        file_name: Vec<String>,
+        initial_position: Option<u32>,
+    ) -> Result<FileOpenResponse, MmsClientError> {
+        let request = ConfirmedServiceRequest::fileOpen(FileOpenRequest::new(
+            FileName(
+                file_name
+                    .into_iter()
+                    .map(|name| {
+                        GraphicString::from_bytes(name.as_bytes())
+                            .map(AnonymousFileName)
+                            .context(VisibleStringConversion)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Unsigned32(initial_position.unwrap_or(0)),
+        ));
+        let response = self.send_request(request).await?;
+        let ConfirmedServiceResponse::fileOpen(response) = response else {
+            return UnexpectedServiceResponse.fail();
+        };
+        Ok(response)
+    }
+
+    async fn file_read(&self, frsm_id: i32) -> Result<Vec<u8>, MmsClientError> {
+        let mut more_follows = true;
+        let mut data = Vec::new();
+        while more_follows {
+            let request = ConfirmedServiceRequest::fileRead(FileReadRequest(Integer32(frsm_id)));
+            let response = self.send_request(request).await?;
+            let ConfirmedServiceResponse::fileRead(response) = response else {
+                return UnexpectedServiceResponse.fail();
+            };
+            more_follows = response.more_follows;
+            data.extend(response.file_data.into_iter());
+        }
+        Ok(data)
+    }
+
+    async fn file_close(&self, frsm_id: i32) -> Result<(), MmsClientError> {
+        let request = ConfirmedServiceRequest::fileClose(FileCloseRequest(Integer32(frsm_id)));
+        let response = self.send_request(request).await?;
+        if matches!(response, ConfirmedServiceResponse::fileClose(_)) {
+            return UnexpectedServiceResponse.fail();
+        };
+        Ok(())
+    }
+
+    async fn file_delete(&self, file_name: Vec<String>) -> Result<(), MmsClientError> {
+        let request = ConfirmedServiceRequest::fileDelete(FileDeleteRequest(FileName(
+            file_name
+                .into_iter()
+                .map(|name| {
+                    GraphicString::from_bytes(name.as_bytes())
+                        .map(AnonymousFileName)
+                        .context(VisibleStringConversion)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )));
+        let response = self.send_request(request).await?;
+        if matches!(response, ConfirmedServiceResponse::fileDelete(_)) {
+            return UnexpectedServiceResponse.fail();
+        };
+        Ok(())
+    }
+
+    async fn file_directory(
+        &self,
+        file_specification: Option<Vec<String>>,
+    ) -> Result<Vec<DirectoryEntry>, MmsClientError> {
+        let mut continue_after = None;
+        let mut more_follows = true;
+        let mut list_of_directory_entry = Vec::new();
+
+        while more_follows {
+            let request = ConfirmedServiceRequest::fileDirectory(FileDirectoryRequest::new(
+                file_specification
+                    .as_ref()
+                    .map(|names| {
+                        names
+                            .iter()
+                            .map(|name| {
+                                GraphicString::from_bytes(name.as_bytes())
+                                    .context(VisibleStringConversion)
+                                    .map(AnonymousFileName)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(FileName)
+                    })
+                    .transpose()?,
+                continue_after,
+            ));
+            let response = self.send_request(request).await?;
+            let ConfirmedServiceResponse::fileDirectory(response) = response else {
+                return UnexpectedServiceResponse.fail();
+            };
+            more_follows = response.more_follows;
+            continue_after = response
+                .list_of_directory_entry
+                .last()
+                .cloned()
+                .map(|entry| entry.file_name);
+            list_of_directory_entry.extend(response.list_of_directory_entry.into_iter());
+        }
+        Ok(list_of_directory_entry)
+    }
+
+    // TODO: This is a IEC61850 specific. Move to a separate module.
     #[instrument(skip(self))]
     pub async fn get_logical_devices(&mut self) -> Result<Vec<String>, MmsClientError> {
-        let request = ConfirmedRequestPDU::new(
-            Unsigned32(0),
-            ConfirmedServiceRequest::getNameList(GetNameListRequest::new(
-                ObjectClass::basicObjectClass(9.into()), // domain
-                GetNameListRequestObjectScope::vmdSpecific(()),
-                None,
-            )),
-        );
-        let data =
-            ber::encode(&MMSpdu::confirmed_RequestPDU(request.clone())).context(EncodeRequest)?;
-        self.acse.send_data(data).await?;
-        let response = self.acse.receive_data().await?;
-        let response: MMSpdu = ber::decode(&response).context(DecodeResponse)?;
-        let MMSpdu::confirmed_ResponsePDU(response) = response else {
-            return UnexpectedServiceResponse.fail();
-        };
-
-        if response.invoke_id != request.invoke_id {
-            return InvokeIdMismatch.fail();
-        }
-        let ConfirmedServiceResponse::getNameList(response) = response.service else {
-            return UnexpectedServiceResponse.fail();
-        };
-
-        Ok(response
-            .list_of_identifier
-            .into_iter()
-            .map(|id| id.0.to_string())
-            .collect())
+        // TODO: Make a enum for the object classes.
+        self.get_name_list(9, GetNameListRequestObjectScope::vmdSpecific(()))
+            .await
     }
+}
+
+async fn handle_connection(
+    mut read_half: AcseReadHalf,
+    mut write_half: AcseWriteHalf,
+    mut rx: mpsc::Receiver<(
+        ConfirmedServiceRequest,
+        oneshot::Sender<ConfirmedServiceResponse>,
+    )>,
+) {
+    let mut invoke_id = 0;
+    let mut response_map: HashMap<u32, oneshot::Sender<ConfirmedServiceResponse>> = HashMap::new();
+    loop {
+        select! {
+            data = read_half.receive_data() => {
+                let data = match data {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::error!("Error receiving data: {:?}", e);
+                        // TODO: Handle error better
+                        break;
+                    }
+                };
+
+                let response: MMSpdu = match ber::decode(&data).context(DecodeResponse) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        tracing::error!("Error decoding response: {:?}", e);
+                        // TODO: Handle error better
+                        continue;
+                    }
+                };
+                let MMSpdu::confirmed_ResponsePDU(response) = response else {
+                    tracing::error!("Unexpected service response");
+                    continue;
+                };
+                let invoke_id = response.invoke_id;
+                let response = response.service;
+                let sender = match response_map.remove(&invoke_id.0) {
+                    Some(sender) => sender,
+                    None => {
+                        tracing::error!("No sender found for invoke ID: {}", invoke_id.0);
+                        continue;
+                    }
+                };
+                let _ = sender.send(response).inspect_err(|e| {
+                    tracing::error!("Error sending response: {:?}", e);
+                    // TODO: Handle error better
+                });
+
+            },
+            request = rx.recv() => {
+                match request {
+                    Some((request, sender)) => {
+                        let data = match prepare_request(invoke_id, request) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                tracing::error!("Error preparing request: {:?}", e);
+                                // TODO: Handle error better
+                                continue;
+                            }
+                        };
+                        if let Err(e) = write_half.send_data(data).await {
+                            tracing::error!("Error sending data: {:?}", e);
+                            // TODO: Handle error better
+                            continue;
+                        }
+                        response_map.insert(invoke_id, sender);
+                        invoke_id += 1;
+                    }
+                    None => {
+                        tracing::info!("No more requests to send");
+                        break;
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn prepare_request(
+    invoke_id: u32,
+    request: ConfirmedServiceRequest,
+) -> Result<Vec<u8>, MmsClientError> {
+    let request =
+        MMSpdu::confirmed_RequestPDU(ConfirmedRequestPDU::new(Unsigned32(invoke_id), request));
+    ber::encode(&request).context(EncodeRequest)
+}
+
+fn make_bitstring(data: &[u8], length: usize) -> BitString {
+    let mut bitstring = BitString::from_slice(data);
+    bitstring.truncate(length);
+    bitstring
 }
 
 /// Presentation layer errors
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum MmsClientError {
+    #[snafu(display("Visible string error"))]
+    VisibleStringConversion {
+        source: rasn::error::strings::PermittedAlphabetError,
+        #[snafu(implicit)]
+        context: Box<SpanTraceWrapper>,
+    },
+    #[snafu(display("Data access error: {}", error))]
+    DataAccessError {
+        error: Integer,
+        #[snafu(implicit)]
+        context: Box<SpanTraceWrapper>,
+    },
+    #[snafu(display("Error sending request"))]
+    SendRequest {
+        source: mpsc::error::SendError<(
+            ConfirmedServiceRequest,
+            oneshot::Sender<ConfirmedServiceResponse>,
+        )>,
+        #[snafu(implicit)]
+        context: Box<SpanTraceWrapper>,
+    },
+    #[snafu(display("Error receiving response"))]
+    ReceiveResponse {
+        source: oneshot::error::RecvError,
+        #[snafu(implicit)]
+        context: Box<SpanTraceWrapper>,
+    },
     #[snafu(display("Error in acse layer"))]
     AcseLayer {
         source: AcseError,
@@ -206,6 +578,10 @@ impl MmsClientError {
             MmsClientError::VersionMismatch { context } => context,
             MmsClientError::DecodeResponse { context, .. } => context,
             MmsClientError::EncodeRequest { context, .. } => context,
+            MmsClientError::SendRequest { context, .. } => context,
+            MmsClientError::ReceiveResponse { context, .. } => context,
+            MmsClientError::DataAccessError { context, .. } => context,
+            MmsClientError::VisibleStringConversion { context, .. } => context,
         }
     }
 }
@@ -230,10 +606,8 @@ mod tests {
         let _g = rust_telemetry::init_otel!(&OtelConfig::for_tests());
         if let Err(e) = async {
             let config = ClientConfig::default();
-            println!("Creating client...");
-            let mut client = MmsClient::new(&config).await?;
             println!("Connecting to server...");
-            client.connect().await?;
+            let mut client = MmsClient::connect(&config).await?;
             println!("Getting logical devices...");
             let devices = client.get_logical_devices().await?;
             println!("Devices: {:?}", devices);
