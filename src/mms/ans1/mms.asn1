@@ -608,7 +608,7 @@ FileDirectory-Request ::= SEQUENCE {
 }
 
 FileDirectory-Response ::= SEQUENCE {
-    listOfDirectoryEntry [0] SEQUENCE OF DirectoryEntry,
+    listOfDirectoryEntry [0] EXPLICIT SEQUENCE OF DirectoryEntry,
     moreFollows [1] IMPLICIT BOOLEAN DEFAULT FALSE
 }
 

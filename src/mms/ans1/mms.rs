@@ -629,7 +629,7 @@ pub mod asn1 {
     #[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
     #[rasn(identifier = "FileDirectory-Response")]
     pub struct FileDirectoryResponse {
-        #[rasn(tag(context, 0), identifier = "listOfDirectoryEntry")]
+        #[rasn(tag(explicit(context, 0)), identifier = "listOfDirectoryEntry")]
         pub list_of_directory_entry: SequenceOf<DirectoryEntry>,
         #[rasn(
             tag(context, 1),

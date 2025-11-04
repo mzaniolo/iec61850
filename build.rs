@@ -18,7 +18,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         let warnings = Compiler::<RasnBackend, _>::new_with_config(config)
             .add_asn_by_path(ans1_file_path(file))
-            .set_output_path(rs_file_path(file))
+            .set_output_mode(rasn_compiler::OutputMode::SingleFile(
+                rs_file_path(file).into(),
+            ))
             .compile()
             .unwrap_or_else(|e| {
                 panic!("Error compiling asn1 file {}: \n{e}", ans1_file_path(file))

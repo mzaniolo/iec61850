@@ -366,6 +366,7 @@ impl MmsClient {
             let ConfirmedServiceResponse::fileDirectory(response) = response else {
                 return UnexpectedServiceResponse.fail();
             };
+
             more_follows = response.more_follows;
             continue_after = response
                 .list_of_directory_entry
@@ -417,7 +418,7 @@ async fn handle_connection(
                     }
                 };
                 let MMSpdu::confirmed_ResponsePDU(response) = response else {
-                    tracing::error!("Unexpected service response");
+                    tracing::error!("Unexpected service response. Response: {:?}", response);
                     continue;
                 };
                 let invoke_id = response.invoke_id;
@@ -611,6 +612,21 @@ mod tests {
             println!("Getting logical devices...");
             let devices = client.get_logical_devices().await?;
             println!("Devices: {:?}", devices);
+            println!("Getting directory...");
+            let directory = client
+                .file_directory(None)
+                .await?
+                .iter()
+                .map(|d| {
+                    d.file_name
+                        .0
+                        .iter()
+                        .map(|f| str::from_utf8(&f.0).expect("Invalid UTF-8"))
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .collect::<Vec<_>>();
+            println!("Directory: {:?}", directory);
             Ok::<(), MmsClientError>(())
         }
         .await
@@ -619,5 +635,44 @@ mod tests {
             println!("Error: {}\n{context}", snafu::Report::from_error(&e));
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_decode_file_directory_response() {
+        use rasn::ber;
+        // Full MMSpdu data from the log
+        let data = vec![
+            0xa1, 0x5d, 0x02, 0x01, 0x01, 0xbf, 0x4d, 0x57, 0xa0, 0x55, 0x30, 0x53, 0x30, 0x29,
+            0xa0, 0x0d, 0x19, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x6c, 0x6f,
+            0x67, 0xa1, 0x18, 0x80, 0x01, 0x0d, 0x81, 0x13, 0x32, 0x30, 0x32, 0x35, 0x31, 0x31,
+            0x30, 0x34, 0x31, 0x39, 0x30, 0x35, 0x32, 0x37, 0x2e, 0x30, 0x30, 0x30, 0x5a, 0x30,
+            0x26, 0xa0, 0x0a, 0x19, 0x08, 0x74, 0x65, 0x73, 0x74, 0x2e, 0x74, 0x78, 0x74, 0xa1,
+            0x18, 0x80, 0x01, 0x10, 0x81, 0x13, 0x32, 0x30, 0x32, 0x35, 0x31, 0x31, 0x30, 0x34,
+            0x31, 0x39, 0x30, 0x35, 0x32, 0x31, 0x2e, 0x30, 0x30, 0x30, 0x5a,
+        ];
+
+        println!("Decoding MMSpdu from {} bytes", data.len());
+        let mms_pdu: MMSpdu = ber::decode(&data).expect("Failed to decode MMSpdu");
+        println!("Decoded MMSpdu: {:?}", mms_pdu);
+
+        if let MMSpdu::confirmed_ResponsePDU(response_pdu) = mms_pdu {
+            if let ConfirmedServiceResponse::fileDirectory(file_dir_response) = response_pdu.service
+            {
+                println!("FileDirectory response: {:?}", file_dir_response);
+                println!(
+                    "Number of entries: {}",
+                    file_dir_response.list_of_directory_entry.len()
+                );
+                assert_eq!(file_dir_response.list_of_directory_entry.len(), 2);
+
+                // Check the file names
+                let entries = &file_dir_response.list_of_directory_entry;
+                assert_eq!(entries.len(), 2);
+            } else {
+                panic!("Expected fileDirectory response");
+            }
+        } else {
+            panic!("Expected confirmed_ResponsePDU");
+        }
     }
 }
