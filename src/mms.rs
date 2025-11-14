@@ -137,3 +137,51 @@ trait WriteHalfConnection {
     type Error: std::error::Error + Send + Sync;
     async fn send_data(&mut self, data: Vec<u8>) -> std::result::Result<(), Self::Error>;
 }
+
+// This is defined on the mms.ans file but the compiler is not generating the enum automatically.
+// So we define it manually here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MmsObjectClass {
+    NamedVariable = 0,
+    ScatteredAccess = 1,
+    NamedVariableList = 2,
+    NamedType = 3,
+    Semaphore = 4,
+    EventCondition = 5,
+    EventAction = 6,
+    EventEnrollment = 7,
+    Journal = 8,
+    Domain = 9,
+    ProgramInvocation = 10,
+    OperatorStation = 11,
+    DataExchange = 12,
+    AccessControlList = 13,
+}
+
+impl TryFrom<u8> for MmsObjectClass {
+    type Error = Error;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(MmsObjectClass::NamedVariable),
+            1 => Ok(MmsObjectClass::ScatteredAccess),
+            2 => Ok(MmsObjectClass::NamedVariableList),
+            3 => Ok(MmsObjectClass::NamedType),
+            4 => Ok(MmsObjectClass::Semaphore),
+            5 => Ok(MmsObjectClass::EventCondition),
+            6 => Ok(MmsObjectClass::EventAction),
+            7 => Ok(MmsObjectClass::EventEnrollment),
+            8 => Ok(MmsObjectClass::Journal),
+            9 => Ok(MmsObjectClass::Domain),
+            10 => Ok(MmsObjectClass::ProgramInvocation),
+            11 => Ok(MmsObjectClass::OperatorStation),
+            12 => Ok(MmsObjectClass::DataExchange),
+            13 => Ok(MmsObjectClass::AccessControlList),
+            _ => Err(Error::Whatever {
+                message: "Invalid object class".to_string(),
+                source: None,
+                context: Box::new(SpanTraceWrapper(SpanTrace::capture())),
+            }),
+        }
+    }
+}
