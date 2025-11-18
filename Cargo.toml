@@ -2,9 +2,30 @@
 name = "iec61850"
 version = "0.1.0"
 edition = "2024"
+authors = ["Matheus Zaniolo <mgzaniolo@gmail.com>"]
+description = "A rust implementation of the IEC61850 protocol."
+license = "MIT"
+repository = "https://github.com/mzaniolo/iec61850"
+homepage = "https://github.com/mzaniolo/iec61850"
+documentation = "https://docs.rs/iec61850"
+readme = "README.md"
+categories = ["network-programming"]
+keywords = [
+    "mms",
+    "61850",
+    "iec61850",
+    "SCADA"
+]
 
 [dependencies]
+async-trait = "0.1.89"
+lazy_static = "1.5.0"
+num-traits = "0.2.19"
 rasn = "0.28.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.145"
+snafu = "0.8.6"
+time = { version = "0.3.44", features = ["parsing", "formatting", "serde-human-readable"] }
 tokio = { version = "1.47.0", features = [
     "macros",
     "rt-multi-thread",
@@ -17,19 +38,12 @@ tokio-native-tls = "0.3.1"
 tracing = "0.1.41"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-snafu = "0.8.6"
-serde = { version = "1.0.219", features = ["derive"] }
-lazy_static = "1.5.0"
-async-trait = "0.1.89"
-time = {version = "0.3.44", features = ["parsing"]}
-num-traits = "0.2.19"
 
 [build-dependencies]
 rasn-compiler = "0.14.3"
 
 [dev-dependencies]
 rust-telemetry = { version = "1.2.0", features = ["tracing-error"] }
-
 
 [workspace.lints.rust]
 dead_code = "warn"

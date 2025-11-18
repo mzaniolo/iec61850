@@ -11,7 +11,7 @@ use tracing::instrument;
 use crate::{
 	iec61850::report::Report,
 	mms::{
-		ClientConfig, ReadHalfConnection, SpanTraceWrapper, WriteHalfConnection,
+		ClientConfig, ReadHalfConnection, ReportCallback, SpanTraceWrapper, WriteHalfConnection,
 		acse::{Acse, AcseError, AcseReadHalf, AcseWriteHalf},
 		ans1::mms::asn1::{self, *},
 	},
@@ -24,22 +24,26 @@ const SERVICE_SUPPORT_OPTIONS: [u8; 11] =
 const PARAMETER_SUPPORT_OPTIONS: [u8; 2] = [0xf1, 0x00];
 
 pub struct MmsClient {
-	max_serv_outstanding_calling: i16,
-	max_serv_outstanding_called: i16,
-	data_structure_nesting_level: i8,
-	max_pdu_size: i32,
+	// TODO: Do we need to store these values?
+	// max_serv_outstanding_calling: i16,
+	// max_serv_outstanding_called: i16,
+	// data_structure_nesting_level: i8,
+	// max_pdu_size: i32,
 	tx: mpsc::Sender<(ConfirmedServiceRequest, oneshot::Sender<ConfirmedServiceResponse>)>,
 }
 
 impl MmsClient {
-	#[instrument]
-	pub async fn connect(config: &ClientConfig) -> Result<Self, MmsClientError> {
+	#[instrument(skip(report_callback))]
+	pub async fn connect(
+		config: &ClientConfig,
+		report_callback: Box<dyn ReportCallback + Send + Sync>,
+	) -> Result<Self, MmsClientError> {
 		let mut acse = Acse::new(config).await?;
 
-		let mut max_serv_outstanding_called = config.max_serv_outstanding_called;
-		let mut max_serv_outstanding_calling = config.max_serv_outstanding_calling;
-		let mut data_structure_nesting_level = config.data_structure_nesting_level;
-		let mut max_pdu_size = config.max_pdu_size;
+		let max_serv_outstanding_called = config.max_serv_outstanding_called;
+		let max_serv_outstanding_calling = config.max_serv_outstanding_calling;
+		let data_structure_nesting_level = config.data_structure_nesting_level;
+		let max_pdu_size = config.max_pdu_size;
 
 		let request = MMSpdu::initiate_RequestPDU(InitiateRequestPDU::new(
 			Some(Integer32(max_pdu_size)),
@@ -83,26 +87,28 @@ impl MmsClient {
 		// TODO: Check if the services supported by the server are supported by the
 		// client
 
-		max_serv_outstanding_called = response.negotiated_max_serv_outstanding_called.0;
-		max_serv_outstanding_calling = response.negotiated_max_serv_outstanding_calling.0;
-		if let Some(level) = response.negotiated_data_structure_nesting_level {
-			data_structure_nesting_level = level.0;
-		}
-		if let Some(size) = response.local_detail_called {
-			max_pdu_size = size.0;
-		}
+		// max_serv_outstanding_called =
+		// response.negotiated_max_serv_outstanding_called.0;
+		// max_serv_outstanding_calling =
+		// response.negotiated_max_serv_outstanding_calling.0; if let Some(level) =
+		// response.negotiated_data_structure_nesting_level {
+		// 	data_structure_nesting_level = level.0;
+		// }
+		// if let Some(size) = response.local_detail_called {
+		// 	max_pdu_size = size.0;
+		// }
 
 		let (read_half, write_half) = acse.split();
 		let (tx, rx) = mpsc::channel(100);
-		let handler = ConnectionHandler::new(read_half, write_half, rx);
+		let handler = ConnectionHandler::new(read_half, write_half, rx, report_callback);
 		tokio::spawn(handler.handle_connection());
 
 		Ok(Self {
 			tx,
-			max_serv_outstanding_calling,
-			max_serv_outstanding_called,
-			data_structure_nesting_level,
-			max_pdu_size,
+			// max_serv_outstanding_calling,
+			// max_serv_outstanding_called,
+			// data_structure_nesting_level,
+			// max_pdu_size,
 		})
 	}
 
@@ -375,6 +381,7 @@ struct ConnectionHandler {
 	write_half: AcseWriteHalf,
 	rx: mpsc::Receiver<(ConfirmedServiceRequest, oneshot::Sender<ConfirmedServiceResponse>)>,
 	response_map: HashMap<u32, oneshot::Sender<ConfirmedServiceResponse>>,
+	report_callback: Box<dyn ReportCallback + Send + Sync>,
 }
 
 impl ConnectionHandler {
@@ -382,8 +389,9 @@ impl ConnectionHandler {
 		read_half: AcseReadHalf,
 		write_half: AcseWriteHalf,
 		rx: mpsc::Receiver<(ConfirmedServiceRequest, oneshot::Sender<ConfirmedServiceResponse>)>,
+		report_callback: Box<dyn ReportCallback + Send + Sync>,
 	) -> Self {
-		Self { read_half, write_half, rx, response_map: HashMap::new() }
+		Self { read_half, write_half, rx, response_map: HashMap::new(), report_callback }
 	}
 
 	async fn handle_connection(mut self) {
@@ -425,7 +433,8 @@ impl ConnectionHandler {
 											continue;
 										}
 									};
-									tracing::info!("Report: {:?}", report);
+									// TODO: Should we spawn a task here?
+									self.report_callback.on_report(report).await;
 								}
 							}
 						}
@@ -651,7 +660,7 @@ mod tests {
 		if let Err(e) = async {
 			let config = ClientConfig::default();
 			println!("Connecting to server...");
-			let client = MmsClient::connect(&config).await?;
+			let client = MmsClient::connect(&config, Box::new(TestReportCallback)).await?;
 			println!("Getting logical devices...");
 			let devices = client
 				.get_name_list(
@@ -727,6 +736,15 @@ mod tests {
 			}
 		} else {
 			panic!("Expected confirmed_ResponsePDU");
+		}
+	}
+
+	struct TestReportCallback;
+
+	#[async_trait::async_trait]
+	impl ReportCallback for TestReportCallback {
+		async fn on_report(&self, report: Report) {
+			tracing::debug!("Report: {:?}", report);
 		}
 	}
 }

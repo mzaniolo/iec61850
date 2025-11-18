@@ -1,9 +1,10 @@
+use serde::{Deserialize, Serialize};
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
 use time::OffsetDateTime;
 
 use crate::iec61850::data::{Bitstring, Iec61850Data, Iec61850DataError};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportControlBlock {
 	pub name: String,
 	pub id: String,                           // Index 0
@@ -22,7 +23,7 @@ pub struct ReportControlBlock {
 	pub reservation_time: i32,                // Index 13
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TriggerOptions {
 	DataChange = 0x02,
@@ -32,7 +33,7 @@ pub enum TriggerOptions {
 	Gi = 0x20,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u16)]
 pub enum OptionalFields {
 	SequenceNumber = 0x0002,

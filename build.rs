@@ -6,6 +6,9 @@ use rasn_compiler::prelude::*;
 const BASE_PATH: &str = "src/mms/ans1";
 
 fn main() -> Result<(), Box<dyn Error>> {
+	// TODO: A fix was introduced in the rasn-compiler to support the any type.
+	// Remove this after the next release https://github.com/librasn/compiler/commit/8219278295ab4f907b48f3dda42980032bfc9a59
+
 	// let files = ["presentation", "acse", "mms"];
 	let files = ["mms"];
 
@@ -30,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn ans1_file_path(file: &str) -> String {
-	format!("{BASE_PATH}/{}.asn1", file)
+	format!("{BASE_PATH}/{}.asn", file)
 }
 
 fn rs_file_path(file: &str) -> String {

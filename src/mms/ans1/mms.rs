@@ -8,8 +8,9 @@
 pub mod asn1 {
 	extern crate alloc;
 	use core::borrow::Borrow;
-	use rasn::prelude::*;
 	use std::sync::LazyLock;
+
+	use rasn::prelude::*;
 	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
 	#[rasn(choice)]
 	pub enum AccessResult {

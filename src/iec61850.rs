@@ -1,33 +1,99 @@
+use std::collections::HashMap;
+
 use rasn::prelude::VisibleString;
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
 use tracing::instrument;
 
 pub mod data;
+pub mod model;
 pub mod rcb;
 pub mod report;
 
 use crate::{
 	iec61850::{
 		data::Iec61850Data,
+		model::{IedModel, LogicalDevice, LogicalNode},
 		rcb::{OptionalFields, ReportControlBlock, ReportControlBlockError, TriggerOptions},
 	},
 	mms::{
-		ClientConfig, MmsObjectClass,
+		ClientConfig, MmsObjectClass, ReportCallback,
 		ans1::mms::asn1::*,
 		client::{MmsClient, MmsClientError},
 	},
 };
 pub struct Iec61850Client {
 	client: MmsClient,
+	ied_model: IedModel,
 }
 
 impl Iec61850Client {
-	pub async fn new(config: ClientConfig) -> Result<Self, Iec61850ClientError> {
-		Ok(Self { client: MmsClient::connect(&config).await? })
+	/// Create a new IEC 61850 client and load the model from the ied.
+	pub async fn new(
+		config: ClientConfig,
+		report_callback: Box<dyn ReportCallback + Send + Sync>,
+	) -> Result<Self, Iec61850ClientError> {
+		let mut client = Self {
+			client: MmsClient::connect(&config, report_callback).await?,
+			ied_model: IedModel::default(),
+		};
+		client.reload_ied_model().await?;
+		Ok(client)
+	}
+
+	/// Reload the model from the ied
+	pub async fn reload_ied_model(&mut self) -> Result<(), Iec61850ClientError> {
+		let model = self.get_ied_model().await?;
+		self.ied_model = model;
+		Ok(())
+	}
+
+	/// Get the IED model.
+	pub fn model(&self) -> &IedModel {
+		&self.ied_model
 	}
 
 	#[instrument(skip(self))]
-	pub async fn get_logical_devices(&self) -> Result<Vec<String>, Iec61850ClientError> {
+	async fn get_ied_model(&self) -> Result<IedModel, Iec61850ClientError> {
+		let mut logical_devices = self
+			.get_logical_devices_names()
+			.await?
+			.into_iter()
+			.map(LogicalDevice::new)
+			.collect::<Vec<_>>();
+
+		for ld in &mut logical_devices {
+			let mut logical_nodes = self
+				.get_logical_nodes_names(&ld.name)
+				.await?
+				.into_iter()
+				.map(|ln| LogicalNode::new(ln, &ld.name))
+				.collect::<Vec<_>>();
+
+			// Build the logical node tree.
+			for ln in &mut logical_nodes {
+				ln.parse_nodes(self.get_data_definition(&ld.name, &ln.name).await?);
+			}
+
+			// TODO: Rethink this to optimize memory allocation.
+			ld.logical_nodes.extend(logical_nodes);
+
+			let reports = self.get_rcbs(&ld.name).await?;
+			ld.add_reports(reports).expect("Failed to add reports");
+
+			let datasets = self.get_datasets(Some(&ld.name)).await?;
+			let mut dataset_entries = HashMap::new();
+			for dataset in datasets {
+				let entries = self.get_dataset(&dataset, Some(&ld.name)).await?;
+				dataset_entries.insert(dataset, entries);
+			}
+			ld.add_datasets(dataset_entries).expect("Failed to add dataset entries");
+		}
+		Ok(IedModel { logical_devices })
+	}
+
+	/// Get the names of the logical devices.
+	#[instrument(skip(self))]
+	pub async fn get_logical_devices_names(&self) -> Result<Vec<String>, Iec61850ClientError> {
 		self.client
 			.get_name_list(
 				MmsObjectClass::Domain as u8,
@@ -36,8 +102,10 @@ impl Iec61850Client {
 			.await
 			.map_err(Into::into)
 	}
+
+	/// Get the names of the logical nodes in a logical device.
 	#[instrument(skip(self))]
-	pub async fn get_logical_nodes(
+	pub async fn get_logical_nodes_names(
 		&self,
 		logical_device: &str,
 	) -> Result<Vec<String>, Iec61850ClientError> {
@@ -49,32 +117,6 @@ impl Iec61850Client {
 			.await
 			.map_err(Into::into)
 			.map(|nodes| nodes.into_iter().filter(|node| !node.contains("$")).collect())
-	}
-
-	#[instrument(skip(self))]
-	pub async fn get_report_control_blocks(
-		&self,
-		logical_device: &str,
-	) -> Result<Vec<String>, Iec61850ClientError> {
-		self.client
-			.get_name_list(
-				MmsObjectClass::NamedVariable as u8,
-				GetNameListRequestObjectScope::domainSpecific(to_identifier(logical_device)?),
-			)
-			.await
-			.map_err(Into::into)
-			.map(|nodes| {
-				nodes
-					.into_iter()
-					.filter(|node| {
-						let mut parts = node.splitn(4, '$');
-						matches!(
-							(parts.next(), parts.next(), parts.next(), parts.next()),
-							(Some(_), Some("BR" | "RP"), Some(_), None)
-						)
-					})
-					.collect()
-			})
 	}
 
 	/// Get the datasets in a logical device.
@@ -95,6 +137,7 @@ impl Iec61850Client {
 			.await
 			.map_err(Into::into)
 	}
+
 	/// Get the variables in a dataset.
 	/// If logical_device is None, the dataset is an association dataset.
 	/// If logical_device is Some, the dataset is a logical device dataset.
@@ -126,8 +169,9 @@ impl Iec61850Client {
 			})
 			.map_err(Into::into)
 	}
+
 	#[instrument(skip(self))]
-	pub async fn get_data_definition(
+	async fn get_data_definition(
 		&self,
 		logical_device: &str,
 		logical_node: &str,
@@ -140,6 +184,7 @@ impl Iec61850Client {
 
 		Ok(response.type_specification)
 	}
+
 	pub async fn create_dataset(
 		&self,
 		path: &str,
@@ -151,18 +196,13 @@ impl Iec61850Client {
 		let (variable_list_name, logical_device) = if path.starts_with("@") {
 			(ObjectName::aa_specific(to_identifier(path.trim_start_matches("@"))?), None)
 		} else {
-			let split_path = path.split('/').collect::<Vec<&str>>();
-			if split_path.len() != 2 {
-				return InvalidPath.fail();
-			}
-			let logical_device = split_path[0];
-			let logical_node = split_path[1];
+			let path = split_path(path)?;
 			(
 				ObjectName::domain_specific(ObjectNameDomainSpecific::new(
-					to_identifier(logical_device)?,
-					to_identifier(logical_node)?,
+					to_identifier(path.0)?,
+					to_identifier(path.1)?,
 				)),
-				Some(logical_device),
+				Some(path.0),
 			)
 		};
 
@@ -188,17 +228,17 @@ impl Iec61850Client {
 		Ok(())
 	}
 
-	async fn read_dataset(&self, dataset: &str) -> Result<Vec<Iec61850Data>, Iec61850ClientError> {
+	pub async fn read_dataset(
+		&self,
+		dataset: &str,
+	) -> Result<Vec<Iec61850Data>, Iec61850ClientError> {
 		let object_name = if dataset.starts_with("@") {
 			ObjectName::aa_specific(to_identifier(dataset.trim_start_matches("@"))?)
 		} else {
-			let split_path = dataset.split('/').collect::<Vec<&str>>();
-			if split_path.len() != 2 {
-				return InvalidPath.fail();
-			}
+			let path = split_path(dataset)?;
 			ObjectName::domain_specific(ObjectNameDomainSpecific::new(
-				to_identifier(split_path[0])?,
-				to_identifier(split_path[1])?,
+				to_identifier(path.0)?,
+				to_identifier(path.1)?,
 			))
 		};
 
@@ -210,7 +250,53 @@ impl Iec61850Client {
 			.map(|data| data.into_iter().map(|d| d.into()).collect())
 	}
 
-	async fn get_report_control_block(
+	pub async fn set_data_value(
+		&self,
+		path: &str,
+		data: Iec61850Data,
+	) -> Result<(), Iec61850ClientError> {
+		let path = split_path(path)?;
+
+		let variable_access_specification = VariableDefs(vec![AnonymousVariableDefs::new(
+			VariableSpecification::name(ObjectName::domain_specific(
+				ObjectNameDomainSpecific::new(to_identifier(path.0)?, to_identifier(path.1)?),
+			)),
+			None,
+		)])
+		.into();
+
+		let list_of_data = vec![data.into()];
+
+		self.client.write(variable_access_specification, list_of_data).await.map_err(Into::into)
+	}
+
+	/// Get all the report control blocks in a logical device.
+	#[instrument(skip(self))]
+	pub async fn get_rcbs(&self, logical_device: &str) -> Result<Vec<String>, Iec61850ClientError> {
+		self.client
+			.get_name_list(
+				MmsObjectClass::NamedVariable as u8,
+				GetNameListRequestObjectScope::domainSpecific(to_identifier(logical_device)?),
+			)
+			.await
+			.map_err(Into::into)
+			.map(|nodes| {
+				nodes
+					.into_iter()
+					.filter(|node| {
+						let mut parts = node.splitn(4, '$');
+						matches!(
+							(parts.next(), parts.next(), parts.next(), parts.next()),
+							(Some(_), Some("BR" | "RP"), Some(_), None)
+						)
+					})
+					.collect()
+			})
+	}
+
+	/// Get a report control block by its path in a logical device.
+	#[instrument(skip(self))]
+	pub async fn get_rcb(
 		&self,
 		logical_device: &str,
 		report_control_block: &str,
@@ -241,32 +327,9 @@ impl Iec61850Client {
 		}
 	}
 
-	pub async fn set_data_value(
-		&self,
-		path: &str,
-		data: Iec61850Data,
-	) -> Result<(), Iec61850ClientError> {
-		let split_path = path.split('/').collect::<Vec<&str>>();
-		if split_path.len() != 2 {
-			return InvalidPath.fail();
-		}
-
-		let variable_access_specification = VariableDefs(vec![AnonymousVariableDefs::new(
-			VariableSpecification::name(ObjectName::domain_specific(
-				ObjectNameDomainSpecific::new(
-					to_identifier(split_path[0])?,
-					to_identifier(split_path[1])?,
-				),
-			)),
-			None,
-		)])
-		.into();
-
-		let list_of_data = vec![data.into()];
-
-		self.client.write(variable_access_specification, list_of_data).await.map_err(Into::into)
-	}
-	pub async fn set_report_control_block_gi(
+	/// Set the GI of a report control block.
+	#[instrument(skip(self))]
+	pub async fn set_rcb_gi(
 		&self,
 		logical_device: &str,
 		report_control_block: &str,
@@ -275,7 +338,10 @@ impl Iec61850Client {
 		let data = Iec61850Data::Bool(gi);
 		self.set_data_value(&format!("{logical_device}/{report_control_block}$GI"), data).await
 	}
-	pub async fn set_report_control_block_enabled(
+
+	/// Set the enabled state of a report control block.
+	#[instrument(skip(self))]
+	pub async fn set_rcb_enabled(
 		&self,
 		logical_device: &str,
 		report_control_block: &str,
@@ -285,7 +351,9 @@ impl Iec61850Client {
 		self.set_data_value(&format!("{logical_device}/{report_control_block}$RptEna"), data).await
 	}
 
-	pub async fn set_report_control_block_dataset(
+	/// Set the dataset of a report control block.
+	#[instrument(skip(self))]
+	pub async fn set_rcb_dataset(
 		&self,
 		logical_device: &str,
 		report_control_block: &str,
@@ -294,7 +362,10 @@ impl Iec61850Client {
 		let data = Iec61850Data::String(dataset.trim_start_matches("@").to_owned());
 		self.set_data_value(&format!("{logical_device}/{report_control_block}$DatSet"), data).await
 	}
-	pub async fn set_report_control_block_integrity_period(
+
+	/// Set the integrity period of a report control block.
+	#[instrument(skip(self))]
+	pub async fn set_rcb_integrity_period(
 		&self,
 		logical_device: &str,
 		report_control_block: &str,
@@ -303,7 +374,10 @@ impl Iec61850Client {
 		let data = Iec61850Data::Unsigned(integrity_period);
 		self.set_data_value(&format!("{logical_device}/{report_control_block}$IntgPd"), data).await
 	}
-	pub async fn set_report_control_block_buffer_time(
+
+	/// Set the buffer time of a report control block.
+	#[instrument(skip(self))]
+	pub async fn set_rcb_buffer_time(
 		&self,
 		logical_device: &str,
 		report_control_block: &str,
@@ -312,7 +386,10 @@ impl Iec61850Client {
 		let data = Iec61850Data::Unsigned(buffer_time);
 		self.set_data_value(&format!("{logical_device}/{report_control_block}$BufTm"), data).await
 	}
-	pub async fn set_report_control_block_trigger_options(
+
+	/// Set the trigger options of a report control block.
+	#[instrument(skip(self))]
+	pub async fn set_rcb_trigger_options(
 		&self,
 		logical_device: &str,
 		report_control_block: &str,
@@ -324,7 +401,10 @@ impl Iec61850Client {
 		)
 		.await
 	}
-	pub async fn set_report_control_block_optional_fields(
+
+	/// Set the optional fields of a report control block.
+	#[instrument(skip(self))]
+	pub async fn set_rcb_optional_fields(
 		&self,
 		logical_device: &str,
 		report_control_block: &str,
@@ -336,6 +416,44 @@ impl Iec61850Client {
 		)
 		.await
 	}
+
+	/// Read data from a logical device.
+	pub async fn read_data_from_ld(
+		&self,
+		logical_device: &str,
+		path: &[&str],
+	) -> Result<Vec<Iec61850Data>, Iec61850ClientError> {
+		let variable_defs = VariableDefs(
+			path.iter()
+				.map(|p| {
+					Ok(AnonymousVariableDefs::new(
+						VariableSpecification::name(ObjectName::domain_specific(
+							ObjectNameDomainSpecific::new(
+								to_identifier(logical_device)?,
+								to_identifier(p)?,
+							),
+						)),
+						None,
+					))
+				})
+				.collect::<Result<Vec<_>, Iec61850ClientError>>()?,
+		);
+
+		Ok(self
+			.client
+			.read(variable_defs.into(), false)
+			.await?
+			.into_iter()
+			.map(|d| d.into())
+			.collect())
+	}
+
+	/// Read single data from a path.
+	/// The path is in the format <logical_device>/<logical_node>.
+	pub async fn read_data(&self, path: &str) -> Result<Vec<Iec61850Data>, Iec61850ClientError> {
+		let path = split_path(path)?;
+		self.read_data_from_ld(path.0, &[path.1]).await
+	}
 }
 
 fn to_identifier<T: AsRef<str>>(value: T) -> Result<Identifier, Iec61850ClientError> {
@@ -343,6 +461,14 @@ fn to_identifier<T: AsRef<str>>(value: T) -> Result<Identifier, Iec61850ClientEr
 		VisibleString::from_iso646_bytes(value.as_ref().as_bytes())
 			.context(ConvertToVisibleString)?,
 	))
+}
+
+fn split_path(path: &str) -> Result<(&str, &str), Iec61850ClientError> {
+	let split_path = path.split('/').collect::<Vec<&str>>();
+	if split_path.len() != 2 {
+		return InvalidPath.fail();
+	}
+	Ok((split_path[0], split_path[1]))
 }
 
 impl std::fmt::Display for ObjectName {
@@ -377,99 +503,5 @@ pub enum Iec61850ClientError {
 impl From<MmsClientError> for Iec61850ClientError {
 	fn from(error: MmsClientError) -> Self {
 		Iec61850ClientError::Client { source: error }
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use std::collections::HashMap;
-
-	use rust_telemetry::config::OtelConfig;
-
-	use super::*;
-
-	#[tokio::test]
-	async fn test_get_logical_nodes() -> Result<(), Iec61850ClientError> {
-		let _g = rust_telemetry::init_otel!(&OtelConfig::for_tests());
-		let client = Iec61850Client::new(ClientConfig::default()).await?;
-		let devices = client.get_logical_devices().await?;
-		println!("Devices: {:?}", devices);
-		let mut map = HashMap::new();
-		for device in devices {
-			let nodes = client.get_logical_nodes(&device).await?;
-			// println!("Nodes: {nodes:?}");
-			map.insert(device, nodes);
-			// for node in nodes {
-			//     let data_definition = client.get_data_definition(&device,
-			// &node).await?;     println!("Data definition: {:#?}",
-			// data_definition); }
-		}
-		let (device, nodes) = map.iter().next().unwrap();
-		let node = nodes.iter().next().unwrap();
-		client
-			.create_dataset(
-				"@MyAssociationDataSet",
-				vec![
-					format!("{device}/MMXU2$MX$TotW$mag$f"),
-					format!("{device}/DGEN1$ST$GnOpSt$stVal"),
-				],
-			)
-			.await?;
-		let datasets = client.get_datasets(Some(device)).await?;
-		println!("Datasets: {datasets:?}");
-		let dataset = client.get_dataset(&datasets[0], Some(device)).await?;
-		println!("Dataset: {dataset:?}");
-		let dataset_name = format!("{device}/{}", datasets[0]);
-		let data = client.read_dataset(&dataset_name).await?;
-		println!("Data: {data:?}");
-		println!("Data: {:?}", data[0]);
-		let report_control_blocks = client.get_report_control_blocks(device).await?;
-		println!("Report control blocks: {report_control_blocks:?}");
-		let report_control_block =
-			client.get_report_control_block(device, &report_control_blocks[0]).await?;
-		println!("Report control block: {report_control_block:?}");
-		client
-			.set_report_control_block_dataset(device, &report_control_blocks[0], &dataset_name)
-			.await?;
-		println!("Set dataset");
-		client
-			.set_report_control_block_integrity_period(device, &report_control_blocks[0], 1000)
-			.await?;
-		println!("Set integrity period");
-		client
-			.set_report_control_block_buffer_time(device, &report_control_blocks[0], 1000)
-			.await?;
-		println!("Set buffer time");
-		client
-			.set_report_control_block_trigger_options(
-				device,
-				&report_control_blocks[0],
-				vec![TriggerOptions::DataChange, TriggerOptions::Integrity, TriggerOptions::Gi],
-			)
-			.await?;
-		println!("Set trigger options");
-		client
-			.set_report_control_block_optional_fields(
-				device,
-				&report_control_blocks[0],
-				vec![
-					OptionalFields::SequenceNumber,
-					OptionalFields::ReportTimestamp,
-					OptionalFields::ReasonForTransmission,
-					OptionalFields::DataSetName,
-					OptionalFields::BufferOverflow,
-					OptionalFields::EntryID,
-					OptionalFields::ConfigurationRevision,
-				],
-			)
-			.await?;
-		println!("Set optional fields");
-		client.set_report_control_block_enabled(device, &report_control_blocks[0], true).await?;
-		println!("Set enabled");
-		client.set_report_control_block_gi(device, &report_control_blocks[0], true).await?;
-		println!("Set GI");
-
-		tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-		Ok(())
 	}
 }
