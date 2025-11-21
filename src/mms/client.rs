@@ -1,3 +1,5 @@
+//! MMS client implementation.
+
 use std::collections::HashMap;
 
 use rasn::{ber, prelude::*};
@@ -17,22 +19,30 @@ use crate::{
 	},
 };
 
+/// The MMS version number.
 const VERSION_NUMBER: i16 = 1;
+/// The minimum PDU size.
 const MIN_PDU_SIZE: i32 = 64;
+/// The service support options.
 const SERVICE_SUPPORT_OPTIONS: [u8; 11] =
 	[0xee, 0x1c, 0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x79, 0xef, 0x18];
+/// The parameter support options.
 const PARAMETER_SUPPORT_OPTIONS: [u8; 2] = [0xf1, 0x00];
 
+/// The MMS client.
+#[derive(Debug)]
 pub struct MmsClient {
 	// TODO: Do we need to store these values?
 	// max_serv_outstanding_calling: i16,
 	// max_serv_outstanding_called: i16,
 	// data_structure_nesting_level: i8,
 	// max_pdu_size: i32,
+	/// The sender for the confirmed service requests.
 	tx: mpsc::Sender<(ConfirmedServiceRequest, oneshot::Sender<ConfirmedServiceResponse>)>,
 }
 
 impl MmsClient {
+	/// Connect to the MMS server.
 	#[instrument(skip(report_callback))]
 	pub async fn connect(
 		config: &ClientConfig,
@@ -112,6 +122,8 @@ impl MmsClient {
 		})
 	}
 
+	/// Send a confirmed service request.
+	#[instrument(skip(self))]
 	async fn send_request(
 		&self,
 		request: ConfirmedServiceRequest,
@@ -121,6 +133,8 @@ impl MmsClient {
 		rx.await.context(ReceiveResponse)
 	}
 
+	/// Get the name list.
+	#[instrument(skip(self))]
 	pub async fn get_name_list(
 		&self,
 		object_class: u8,
@@ -151,6 +165,8 @@ impl MmsClient {
 		Ok(name_list)
 	}
 
+	/// Read data from the MMS server.
+	#[instrument(skip(self))]
 	pub async fn read(
 		&self,
 		variable_access_specification: VariableAccessSpecification,
@@ -175,6 +191,8 @@ impl MmsClient {
 			.collect::<Result<Vec<Data>, MmsClientError>>()
 	}
 
+	/// Write data to the MMS server.
+	#[instrument(skip(self))]
 	pub async fn write(
 		&self,
 		variable_access_specification: VariableAccessSpecification,
@@ -201,6 +219,8 @@ impl MmsClient {
 			.unwrap_or(Ok(()))
 	}
 
+	/// Get the variable access attributes.
+	#[instrument(skip(self))]
 	pub async fn get_variable_access_attributes(
 		&self,
 		object_name: ObjectName,
@@ -216,6 +236,8 @@ impl MmsClient {
 		Ok(response)
 	}
 
+	/// Define a named variable list.
+	#[instrument(skip(self))]
 	pub async fn define_named_variable_list(
 		&self,
 		variable_list_name: ObjectName,
@@ -231,6 +253,8 @@ impl MmsClient {
 		Ok(())
 	}
 
+	/// Get the named variable list attributes.
+	#[instrument(skip(self))]
 	pub async fn get_named_variable_list_attributes(
 		&self,
 		object_name: ObjectName,
@@ -245,6 +269,8 @@ impl MmsClient {
 		Ok(response)
 	}
 
+	/// Delete a named variable list.
+	#[instrument(skip(self))]
 	pub async fn delete_named_variable_list(
 		&self,
 		scope_of_delete: u32,
@@ -269,6 +295,8 @@ impl MmsClient {
 		Ok(response)
 	}
 
+	/// Open a file.
+	#[instrument(skip(self))]
 	pub async fn file_open(
 		&self,
 		file_name: Vec<String>,
@@ -294,6 +322,8 @@ impl MmsClient {
 		Ok(response)
 	}
 
+	/// Read data from a file.
+	#[instrument(skip(self))]
 	pub async fn file_read(&self, frsm_id: i32) -> Result<Vec<u8>, MmsClientError> {
 		let mut more_follows = true;
 		let mut data = Vec::new();
@@ -309,6 +339,8 @@ impl MmsClient {
 		Ok(data)
 	}
 
+	/// Close a file.
+	#[instrument(skip(self))]
 	pub async fn file_close(&self, frsm_id: i32) -> Result<(), MmsClientError> {
 		let request = ConfirmedServiceRequest::fileClose(FileCloseRequest(Integer32(frsm_id)));
 		let response = self.send_request(request).await?;
@@ -318,6 +350,8 @@ impl MmsClient {
 		Ok(())
 	}
 
+	/// Delete a file.
+	#[instrument(skip(self))]
 	pub async fn file_delete(&self, file_name: Vec<String>) -> Result<(), MmsClientError> {
 		let request = ConfirmedServiceRequest::fileDelete(FileDeleteRequest(FileName(
 			file_name
@@ -336,6 +370,8 @@ impl MmsClient {
 		Ok(())
 	}
 
+	/// Get the file directory.
+	#[instrument(skip(self))]
 	pub async fn file_directory(
 		&self,
 		file_specification: Option<Vec<String>>,
@@ -376,15 +412,23 @@ impl MmsClient {
 	}
 }
 
+/// The handler for the MMS connection.
 struct ConnectionHandler {
+	/// The read half.
 	read_half: AcseReadHalf,
+	/// The write half.
 	write_half: AcseWriteHalf,
+	/// The receiver for the confirmed service requests.
 	rx: mpsc::Receiver<(ConfirmedServiceRequest, oneshot::Sender<ConfirmedServiceResponse>)>,
+	/// The map of the response senders.
 	response_map: HashMap<u32, oneshot::Sender<ConfirmedServiceResponse>>,
+	/// The report callback.
 	report_callback: Box<dyn ReportCallback + Send + Sync>,
 }
 
 impl ConnectionHandler {
+	/// Create a new connection handler.
+	#[must_use]
 	pub fn new(
 		read_half: AcseReadHalf,
 		write_half: AcseWriteHalf,
@@ -394,6 +438,9 @@ impl ConnectionHandler {
 		Self { read_half, write_half, rx, response_map: HashMap::new(), report_callback }
 	}
 
+	/// Handle the MMS connection.
+	/// This is the main loop for the MMS connection.
+	#[instrument(skip(self))]
 	async fn handle_connection(mut self) {
 		let mut invoke_id = 0;
 		loop {
@@ -485,27 +532,33 @@ impl ConnectionHandler {
 		}
 	}
 
+	/// Handle a confirmed response.
+	#[instrument(skip(self))]
 	async fn handle_confirmed_response(&mut self, response: ConfirmedResponsePDU) {
 		let invoke_id = response.invoke_id;
 		let response = response.service;
-		let sender = match self.response_map.remove(&invoke_id.0) {
-			Some(sender) => sender,
-			None => {
-				tracing::error!("No sender found for invoke ID: {}", invoke_id.0);
-				return;
-			}
+		let Some(sender) = self.response_map.remove(&invoke_id.0) else {
+			tracing::error!("No sender found for invoke ID: {}", invoke_id.0);
+			return;
 		};
+
 		let _ = sender.send(response).inspect_err(|e| {
 			tracing::error!("Error sending response: {:?}", e);
 			// TODO: Handle error better
 		});
 	}
+
+	/// Handle a confirmed error.
+	#[instrument(skip(self))]
 	async fn handle_confirmed_error(&mut self, response: ConfirmedErrorPDU) {
 		let invoke_id = response.invoke_id;
 		// Dropping the sender will close the channel.
 		// TODO: Forward back the error to the caller.
 		let _ = self.response_map.remove(&invoke_id.0);
 	}
+
+	/// Handle a rejected PDU.
+	#[instrument(skip(self))]
 	async fn handle_rejected_pdu(&mut self, response: RejectPDU) {
 		tracing::info!("Rejected PDU: {:?}", response);
 		if let Some(invoke_id) = response.original_invoke_id {
@@ -516,6 +569,9 @@ impl ConnectionHandler {
 	}
 }
 
+/// Prepare a request for sending.
+/// This function will prepare the request for sending by encoding it and adding
+/// the invoke ID.
 fn prepare_request(
 	invoke_id: u32,
 	request: ConfirmedServiceRequest,
@@ -525,13 +581,18 @@ fn prepare_request(
 	ber::encode(&request).context(EncodeRequest)
 }
 
+/// Make a bitstring from the data.
+/// This function will make a bitstring from the data by truncating it to the
+/// length of the data.
+#[must_use]
 fn make_bitstring(data: &[u8], length: usize) -> BitString {
 	let mut bitstring = BitString::from_slice(data);
 	bitstring.truncate(length);
 	bitstring
 }
 
-/// Presentation layer errors
+#[allow(missing_docs)]
+/// MMS client errors
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum MmsClientError {
@@ -618,6 +679,8 @@ pub enum MmsClientError {
 }
 
 impl MmsClientError {
+	/// Get the context of the MMS client error.
+	#[must_use]
 	pub fn get_context(&self) -> &SpanTraceWrapper {
 		match self {
 			MmsClientError::AcseLayer { context, .. } => context,
@@ -647,6 +710,7 @@ impl From<AcseError> for MmsClientError {
 	}
 }
 
+#[allow(clippy::print_stdout, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
 	use rust_telemetry::config::OtelConfig;

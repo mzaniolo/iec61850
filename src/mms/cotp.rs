@@ -1,3 +1,5 @@
+//! COTP and RFC1006 implementation.
+
 use std::{pin::Pin, time::Duration};
 
 use async_trait::async_trait;
@@ -16,23 +18,34 @@ use crate::mms::{
 	ClientConfig, ReadHalfConnection, SpanTraceWrapper, TlsClientConfig, WriteHalfConnection,
 };
 
+/// The version of the TPKT protocol.
 pub(super) const TPKT_VERSION: u8 = 0x03;
+/// The maximum size of a COTP TPDU.
 pub(super) const COTP_MAX_TPDU_SIZE: u32 = 8192;
+/// The size of the COTP DT header.
 pub(super) const COTP_DT_HEADER_SIZE: usize = 3;
+/// The size of the TPKT header.
 pub(super) const TPKT_HEADER_SIZE: usize = 4;
 
+/// The COTP connection.
 #[derive(Debug)]
 pub struct CotpConnection {
+	/// The read half of the connection.
 	read_connection: CotpReadHalf,
+	/// The write half of the connection.
 	write_connection: CotpWriteHalf,
 }
 
 impl CotpConnection {
+	/// Establish a connection to the server.
 	#[instrument]
 	pub async fn connect(config: &ClientConfig) -> Result<Self, CotpError> {
 		let connection = make_connection(config).await?;
 		Self::request_connection(connection, config).await
 	}
+
+	/// Request a connection to the server and negotiate the connection
+	/// parameters.
 	#[instrument(skip(config))]
 	async fn request_connection(
 		mut connection: Connection,
@@ -81,6 +94,9 @@ impl CotpConnection {
 
 		ConnectionFailed.fail()
 	}
+
+	/// Split the connection into a read half and a write half.
+	#[must_use]
 	pub fn split(self) -> (CotpReadHalf, CotpWriteHalf) {
 		(self.read_connection, self.write_connection)
 	}
@@ -106,8 +122,10 @@ impl WriteHalfConnection for CotpConnection {
 	}
 }
 
+/// The read half of the COTP connection.
 #[derive(Debug)]
 pub struct CotpReadHalf {
+	/// The read half of the connection.
 	connection: ReadHalf<Connection>,
 }
 
@@ -140,6 +158,7 @@ impl ReadHalfConnection for CotpReadHalf {
 }
 
 impl CotpReadHalf {
+	/// Read a TPKT from the connection.
 	#[instrument(skip(connection))]
 	async fn read_tpkt<R: AsyncRead + Unpin>(connection: &mut R) -> Result<Tpkt, CotpError> {
 		let mut buffer = [0; TPKT_HEADER_SIZE];
@@ -170,9 +189,12 @@ impl CotpReadHalf {
 	}
 }
 
+/// The write half of the COTP connection.
 #[derive(Debug)]
 pub struct CotpWriteHalf {
+	/// The write half of the connection.
 	connection: WriteHalf<Connection>,
+	/// The TPDU size of the COTP connection.
 	tpdu_size: u32,
 }
 
@@ -180,7 +202,7 @@ pub struct CotpWriteHalf {
 impl WriteHalfConnection for CotpWriteHalf {
 	type Error = CotpError;
 	#[instrument(skip(self))]
-	async fn send_data(&mut self, data: Vec<u8>) -> std::result::Result<(), Self::Error> {
+	async fn send_data(&mut self, data: Vec<u8>) -> Result<(), Self::Error> {
 		let max_dt_data_size = self.tpdu_size as usize - COTP_DT_HEADER_SIZE;
 		let num_dts = data.len().div_ceil(max_dt_data_size);
 		let buffer_size = num_dts * (TPKT_HEADER_SIZE + COTP_DT_HEADER_SIZE) + data.len();
@@ -198,13 +220,18 @@ impl WriteHalfConnection for CotpWriteHalf {
 	}
 }
 
+/// The TPKT packet.
 #[derive(Debug, Clone)]
 struct Tpkt {
-	length: u16, //includes the header. The tpdu length is length - 4
+	/// The length of the TPKT packet, including the header.
+	/// The COTP TPDU length is length - 4.
+	length: u16,
+	/// The COTP TPDU.
 	cotp: Cotp,
 }
 
 impl Tpkt {
+	/// Convert the TPKT packet to a byte array.
 	fn to_bytes(&self) -> Vec<u8> {
 		let mut bytes = Vec::with_capacity(self.length as usize);
 		bytes.push(TPKT_VERSION);
@@ -213,20 +240,27 @@ impl Tpkt {
 		bytes.extend_from_slice(&self.cotp.to_bytes());
 		bytes
 	}
+
+	/// Convert a COTP TPDU to a TPKT packet.
 	#[instrument(level = "debug")]
 	fn from_cotp(cotp: Cotp) -> Self {
 		Self { length: (cotp.len() + TPKT_HEADER_SIZE) as u16, cotp }
 	}
 }
 
+/// The COTP TPDU.
 #[derive(Debug, Clone)]
 enum Cotp {
+	/// The CR TPDU.
 	Cr(CrTpdu),
+	/// The CC TPDU.
 	Cc(CcTpdu),
+	/// The DT TPDU.
 	Dt(DtTpdu),
 }
 
 impl Cotp {
+	/// Convert a byte array to a COTP TPDU.
 	#[instrument(level = "debug")]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
 		match (*bytes.get(1).context(NotEnoughBytes)?).into() {
@@ -241,6 +275,7 @@ impl Cotp {
 		}
 	}
 
+	/// Convert a COTP TPDU to a byte array.
 	fn to_bytes(&self) -> Vec<u8> {
 		match self {
 			Self::Cr(tpdu) => tpdu.to_bytes(),
@@ -248,7 +283,9 @@ impl Cotp {
 			Self::Dt(tpdu) => tpdu.to_bytes(),
 		}
 	}
-	fn len(&self) -> usize {
+
+	/// Get the length of the COTP TPDU.
+	const fn len(&self) -> usize {
 		match self {
 			Self::Cr(tpdu) => tpdu.len(),
 			Self::Cc(tpdu) => tpdu.len(),
@@ -257,12 +294,17 @@ impl Cotp {
 	}
 }
 
+/// The type of the COTP TPDU
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TpduType {
+	/// The CR TPDU type.
 	CR = 0xe0,
+	/// The CC TPDU type.
 	CC = 0xd0,
+	/// The DT TPDU type.
 	DT = 0xf0,
+	/// The invalid TPDU type.
 	Invalid = 0xff,
 }
 
@@ -278,24 +320,34 @@ impl From<u8> for TpduType {
 	}
 }
 
+/// The CR TPDU.
 #[derive(Debug, Clone)]
 struct CrTpdu {
+	/// The length indicator of the CR TPDU.
 	li: u8,
+	/// The destination reference of the CR TPDU.
 	dst_ref: u16,
+	/// The source reference of the CR TPDU.
 	src_ref: u16,
+
 	// class: u8, -> Always 0
+	/// The options of the CR TPDU.
 	options: Vec<CotpOptions>,
 }
 
 impl CrTpdu {
+	/// Create a new CR TPDU.
+	#[must_use]
 	fn new(dst_ref: u16, src_ref: u16, options: Vec<CotpOptions>) -> Self {
 		Self {
-			li: (options.iter().map(|option| option.len()).sum::<usize>() + 6) as u8,
+			li: (options.iter().map(CotpOptions::len).sum::<usize>() + 6) as u8,
 			dst_ref,
 			src_ref,
 			options,
 		}
 	}
+
+	/// Convert a byte array to a CR TPDU.
 	#[instrument(level = "debug")]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
 		let li = *bytes.first().context(NotEnoughBytes)?;
@@ -322,6 +374,7 @@ impl CrTpdu {
 		Ok(Self { li, dst_ref, src_ref, options })
 	}
 
+	/// Convert a CR TPDU to a byte array.
 	fn to_bytes(&self) -> Vec<u8> {
 		let mut bytes = Vec::with_capacity(self.li as usize + 1);
 		bytes.push(self.li);
@@ -332,30 +385,41 @@ impl CrTpdu {
 		bytes.extend_from_slice(&options_to_bytes(&self.options));
 		bytes
 	}
-	fn len(&self) -> usize {
+
+	/// Get the length of the CR TPDU.
+	const fn len(&self) -> usize {
 		self.li as usize + 1
 	}
 }
 
+/// The CC TPDU.
 #[derive(Debug, Clone)]
 struct CcTpdu {
+	/// The length indicator of the CC TPDU.
 	li: u8,
+	/// The destination reference of the CC TPDU.
 	dst_ref: u16,
+	/// The source reference of the CC TPDU.
 	src_ref: u16,
 	// class: u8, -> Always 0
+	/// The options of the CC TPDU.
 	options: Vec<CotpOptions>,
 }
 
 impl CcTpdu {
+	/// Create a new CC TPDU.
+	#[must_use]
 	#[allow(dead_code)]
 	fn new(dst_ref: u16, src_ref: u16, options: Vec<CotpOptions>) -> Self {
 		Self {
-			li: (options.iter().map(|option| option.len()).sum::<usize>() + 6) as u8,
+			li: (options.iter().map(CotpOptions::len).sum::<usize>() + 6) as u8,
 			dst_ref,
 			src_ref,
 			options,
 		}
 	}
+
+	/// Convert a byte array to a CC TPDU.
 	#[instrument(level = "debug")]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
 		let li = *bytes.first().context(NotEnoughBytes)?;
@@ -382,6 +446,7 @@ impl CcTpdu {
 		Ok(Self { li, dst_ref, src_ref, options })
 	}
 
+	/// Convert a CC TPDU to a byte array.
 	fn to_bytes(&self) -> Vec<u8> {
 		let mut bytes = Vec::with_capacity(self.li as usize + 6);
 		bytes.push(self.li);
@@ -392,21 +457,30 @@ impl CcTpdu {
 		bytes.extend_from_slice(&options_to_bytes(&self.options));
 		bytes
 	}
-	fn len(&self) -> usize {
+
+	/// Get the length of the CC TPDU.
+	const fn len(&self) -> usize {
 		self.li as usize + 1
 	}
 }
 
+/// The DT TPDU.
 #[derive(Debug, Clone)]
 struct DtTpdu {
+	/// The end of transmission of the DT TPDU.
 	eot: Eot,
+	/// The data of the DT TPDU.
 	data: Vec<u8>,
 }
 
 impl DtTpdu {
-	fn new(eot: Eot, data: Vec<u8>) -> Self {
+	/// Create a new DT TPDU.
+	#[must_use]
+	const fn new(eot: Eot, data: Vec<u8>) -> Self {
 		Self { eot, data }
 	}
+
+	/// Convert a byte array to a DT TPDU.
 	#[instrument(level = "debug")]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
 		if *bytes.first().context(NotEnoughBytes)? != 0x02 {
@@ -430,6 +504,7 @@ impl DtTpdu {
 		Ok(Self { eot, data })
 	}
 
+	/// Convert a DT TPDU to a byte array.
 	fn to_bytes(&self) -> Vec<u8> {
 		let mut bytes = Vec::with_capacity(2 + self.data.len());
 		bytes.push(0x02); // LI
@@ -438,15 +513,20 @@ impl DtTpdu {
 		bytes.extend_from_slice(&self.data);
 		bytes
 	}
-	fn len(&self) -> usize {
+
+	/// Get the length of the DT TPDU.
+	const fn len(&self) -> usize {
 		3 + self.data.len()
 	}
 }
 
+/// The end of transmission of the DT TPDU.
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Eot {
+	/// Indicates that there is more data to come.
 	NoEot = 0x00,
+	/// Indicates that this is the last data package.
 	Eot = 0x80,
 }
 
@@ -462,6 +542,7 @@ impl TryFrom<u8> for Eot {
 	}
 }
 
+/// Convert a byte array to a vector of COTP options.
 #[instrument(level = "debug")]
 fn bytes_to_options(bytes: &[u8]) -> Result<Vec<CotpOptions>, CotpError> {
 	let mut options = Vec::new();
@@ -502,6 +583,7 @@ fn bytes_to_options(bytes: &[u8]) -> Result<Vec<CotpOptions>, CotpError> {
 	Ok(options)
 }
 
+/// Convert a vector of COTP options to a byte array.
 fn options_to_bytes(options: &[CotpOptions]) -> Vec<u8> {
 	let mut bytes = Vec::new();
 	for option in options {
@@ -510,14 +592,19 @@ fn options_to_bytes(options: &[CotpOptions]) -> Vec<u8> {
 	bytes
 }
 
+/// The options of the COTP TPDU.
 #[derive(Debug, Clone)]
 enum CotpOptions {
+	/// The TPDU size option.
 	TpduSize(TpduSize),
+	/// The TSelDst option.
 	TSelDst(TselDst),
+	/// The TSelSrc option.
 	TSelSrc(TselSrc),
 }
 
 impl CotpOptions {
+	/// Convert a COTP option to a byte array.
 	fn to_bytes(&self) -> Vec<u8> {
 		match self {
 			CotpOptions::TpduSize(tpdu_size) => tpdu_size.to_bytes().to_vec(),
@@ -525,35 +612,43 @@ impl CotpOptions {
 			CotpOptions::TSelSrc(ts_el_src) => ts_el_src.to_bytes(),
 		}
 	}
-	fn len(&self) -> usize {
+	/// Get the length of the COTP option.
+	const fn len(&self) -> usize {
 		match self {
-			CotpOptions::TpduSize(tpdu_size) => tpdu_size.len(),
+			CotpOptions::TpduSize(_) => TpduSize::len(),
 			CotpOptions::TSelDst(ts_el_dst) => ts_el_dst.len(),
 			CotpOptions::TSelSrc(ts_el_src) => ts_el_src.len(),
 		}
 	}
 }
 
+/// The TPDU size option.
 #[derive(Debug, Clone)]
 struct TpduSize {
+	/// The value of the TPDU size option.
 	value: u8,
 }
 
 impl TpduSize {
+	/// Create a new TPDU size option.
 	pub fn new(value: u32) -> Self {
 		Self { value: Self::calculate_value(value) }
 	}
-	pub fn get_value(&self) -> u32 {
+	/// Get the value of the TPDU size option.
+	#[must_use]
+	pub const fn get_value(&self) -> u32 {
 		1 << self.value
 	}
+	/// Calculate the value of the TPDU size option.
 	fn calculate_value(mut value: u32) -> u8 {
 		if !(1..=COTP_MAX_TPDU_SIZE).contains(&value) {
 			value = COTP_MAX_TPDU_SIZE;
 		}
 		value.ilog2() as u8
 	}
+	/// Convert a byte array to a TPDU size option.
 	#[instrument(level = "debug")]
-	fn from_bytes(bytes: &[u8; 3]) -> Result<Self, CotpError> {
+	fn from_bytes(bytes: [u8; 3]) -> Result<Self, CotpError> {
 		if bytes[0] != 0xc0 {
 			return InvalidTpduSize.fail();
 		}
@@ -564,20 +659,26 @@ impl TpduSize {
 		let value = bytes[2];
 		Ok(Self { value })
 	}
-	fn to_bytes(&self) -> [u8; 3] {
+	/// Convert a TPDU size option to a byte array.
+	#[must_use]
+	const fn to_bytes(&self) -> [u8; 3] {
 		[0xc0, 0x01, self.value]
 	}
-	fn len(&self) -> usize {
+	/// Get the length of the TPDU size option.
+	const fn len() -> usize {
 		3
 	}
 }
 
+/// The TSelDst option.
 #[derive(Debug, Clone)]
 struct TselDst {
+	/// The value of the TSelDst option.
 	value: Vec<u8>,
 }
 
 impl TselDst {
+	/// Convert a byte array to a TSelDst option.
 	#[instrument(level = "debug")]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
 		if *bytes.first().context(NotEnoughBytes)? != 0xc2 {
@@ -587,6 +688,7 @@ impl TselDst {
 		let value = bytes.get(2..2 + len as usize).context(NotEnoughBytes)?.to_vec();
 		Ok(Self { value })
 	}
+	/// Convert a TSelDst option to a byte array.
 	fn to_bytes(&self) -> Vec<u8> {
 		let mut bytes = Vec::with_capacity(2 + self.value.len());
 		bytes.push(0xc2);
@@ -594,17 +696,21 @@ impl TselDst {
 		bytes.extend_from_slice(&self.value);
 		bytes
 	}
-	fn len(&self) -> usize {
+	/// Get the length of the TSelDst option.
+	const fn len(&self) -> usize {
 		2 + self.value.len()
 	}
 }
 
+/// The TSelSrc option.
 #[derive(Debug, Clone)]
 struct TselSrc {
+	/// The value of the TSelSrc option.
 	value: Vec<u8>,
 }
 
 impl TselSrc {
+	/// Convert a byte array to a TSelSrc option.
 	#[instrument(level = "debug")]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
 		if *bytes.first().context(NotEnoughBytes)? != 0xc1 {
@@ -615,6 +721,7 @@ impl TselSrc {
 		Ok(Self { value })
 	}
 
+	/// Convert a TSelSrc option to a byte array.
 	fn to_bytes(&self) -> Vec<u8> {
 		let mut bytes = Vec::with_capacity(2 + self.value.len());
 		bytes.push(0xc1);
@@ -622,11 +729,14 @@ impl TselSrc {
 		bytes.extend_from_slice(&self.value);
 		bytes
 	}
-	fn len(&self) -> usize {
+	/// Get the length of the TSelSrc option.
+	const fn len(&self) -> usize {
 		2 + self.value.len()
 	}
 }
 
+/// The error type for the COTP library.
+#[allow(missing_docs)]
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum CotpError {
@@ -706,6 +816,8 @@ pub enum CotpError {
 }
 
 impl CotpError {
+	/// Get the context of the error.
+	#[must_use]
 	pub fn get_context(&self) -> &SpanTraceWrapper {
 		match self {
 			CotpError::InvalidLiValue { context, .. } => context,
@@ -728,7 +840,9 @@ impl CotpError {
 /// Connection
 #[derive(Debug)]
 enum Connection {
+	/// The TCP connection.
 	Tcp(TcpStream),
+	/// The TLS connection.
 	Tls(TlsStream<TcpStream>),
 }
 
@@ -756,6 +870,7 @@ async fn make_connection(config: &ClientConfig) -> Result<Connection, CotpError>
 	})
 }
 
+/// Make a TLS connector.
 #[instrument(level = "debug")]
 fn make_tls_connector(tls: &TlsClientConfig) -> Result<TlsConnector, CotpError> {
 	let root_cert: Option<Certificate> = tls
@@ -844,6 +959,7 @@ impl AsyncWrite for Connection {
 	}
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -878,17 +994,17 @@ mod tests {
 		let bytes = tpdu_size.to_bytes();
 		assert_eq!(bytes, [0xc0, 0x01, 13]);
 
-		let decoded = TpduSize::from_bytes(&bytes).unwrap();
+		let decoded = TpduSize::from_bytes(bytes).unwrap();
 		assert_eq!(decoded.value, 13);
 	}
 
 	#[test]
 	fn test_tpdu_size_invalid_encoding() {
 		let invalid_bytes = [0xc1, 0x01, 13]; // Wrong option type
-		assert!(TpduSize::from_bytes(&invalid_bytes).is_err());
+		assert!(TpduSize::from_bytes(invalid_bytes).is_err());
 
 		let invalid_bytes = [0xc0, 0x02, 13]; // Wrong length
-		assert!(TpduSize::from_bytes(&invalid_bytes).is_err());
+		assert!(TpduSize::from_bytes(invalid_bytes).is_err());
 	}
 
 	#[test]

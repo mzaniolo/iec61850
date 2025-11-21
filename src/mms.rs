@@ -1,3 +1,5 @@
+//! MMS implementation.
+
 use std::{fmt, path::PathBuf};
 
 use async_trait::async_trait;
@@ -17,26 +19,42 @@ pub mod session;
 pub mod client;
 
 //TODO: Split this into multiple configs
+/// The client configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClientConfig {
 	/// The address of the server.
 	pub address: String,
 	/// The port of the server.
 	pub port: u16,
+	/// The local transport selector.
 	pub local_t_sel: Vec<u8>,
+	/// The remote transport selector.
 	pub remote_t_sel: Vec<u8>,
+	/// The TPDU size.
 	pub tpdu_size: u32,
+	/// The local session selector.
 	pub local_s_sel: Vec<u8>,
+	/// The remote session selector.
 	pub remote_s_sel: Vec<u8>,
+	/// The local presentation selector.
 	pub local_p_sel: Vec<u8>,
+	/// The remote presentation selector.
 	pub remote_p_sel: Vec<u8>,
+	/// The local AP title.
 	pub local_ap_title: Option<Vec<u32>>,
+	/// The remote AP title.
 	pub remote_ap_title: Option<Vec<u32>>,
+	/// The local AE qualifier.
 	pub local_ae_qualifier: Option<u32>,
+	/// The remote AE qualifier.
 	pub remote_ae_qualifier: Option<u32>,
+	/// The maximum number of outstanding calling services.
 	pub max_serv_outstanding_calling: i16,
+	/// The maximum number of outstanding called services.
 	pub max_serv_outstanding_called: i16,
+	/// The data structure nesting level.
 	pub data_structure_nesting_level: i8,
+	/// The maximum PDU size.
 	pub max_pdu_size: i32,
 	/// The TLS configuration.
 	#[serde(default)]
@@ -72,7 +90,7 @@ pub struct TlsClientConfig {
 impl Default for ClientConfig {
 	fn default() -> Self {
 		Self {
-			address: "localhost".to_string(),
+			address: "localhost".to_owned(),
 			port: 102,
 			tpdu_size: COTP_MAX_TPDU_SIZE,
 			local_t_sel: vec![0x00, 0x01],
@@ -94,6 +112,7 @@ impl Default for ClientConfig {
 	}
 }
 
+/// A wrapper for the span trace
 #[derive(Debug, Clone)]
 pub struct SpanTraceWrapper(SpanTrace);
 
@@ -113,6 +132,8 @@ impl fmt::Display for SpanTraceWrapper {
 	}
 }
 
+#[allow(missing_docs)]
+/// MMS errors
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum Error {
@@ -126,20 +147,26 @@ pub enum Error {
 	},
 }
 
+/// A trait for a read half connection.
 #[async_trait]
 trait ReadHalfConnection {
+	/// The error type for the read half connection.
 	type Error: std::error::Error + Send + Sync;
-	async fn receive_data(&mut self) -> std::result::Result<Vec<u8>, Self::Error>;
+	async fn receive_data(&mut self) -> Result<Vec<u8>, Self::Error>;
 }
 
+/// A trait for a write half connection.
 #[async_trait]
 trait WriteHalfConnection {
+	/// The error type for the write half connection.
 	type Error: std::error::Error + Send + Sync;
-	async fn send_data(&mut self, data: Vec<u8>) -> std::result::Result<(), Self::Error>;
+	async fn send_data(&mut self, data: Vec<u8>) -> Result<(), Self::Error>;
 }
 
+#[allow(missing_docs)]
 // This is defined on the mms.ans file but the compiler is not generating the
 // enum automatically. So we define it manually here.
+/// The MMS object class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum MmsObjectClass {
@@ -178,7 +205,7 @@ impl TryFrom<u8> for MmsObjectClass {
 			12 => Ok(MmsObjectClass::DataExchange),
 			13 => Ok(MmsObjectClass::AccessControlList),
 			_ => Err(Error::Whatever {
-				message: "Invalid object class".to_string(),
+				message: "Invalid object class".to_owned(),
 				source: None,
 				context: Box::new(SpanTraceWrapper(SpanTrace::capture())),
 			}),
@@ -186,7 +213,9 @@ impl TryFrom<u8> for MmsObjectClass {
 	}
 }
 
+/// A trait for reacting to a new report.
 #[async_trait]
+#[allow(missing_docs)]
 pub trait ReportCallback {
 	async fn on_report(&self, report: Report);
 }

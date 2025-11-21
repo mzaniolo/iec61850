@@ -1,3 +1,5 @@
+//! ISO ACSE Layer Implementation (ISO 8327)
+
 use async_trait::async_trait;
 use rasn::{ber, prelude::*};
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
@@ -9,16 +11,26 @@ use crate::mms::{
 	presentation::{Presentation, PresentationError, PresentationReadHalf, PresentationWriteHalf},
 };
 
+/// The ASO context name.
 const ASO_CONTEXT_NAME: [u32; 5] = [1, 0, 9506, 2, 3];
+
+/// The ACSE layer.
+#[derive(Debug)]
 pub struct Acse {
+	/// The presentation layer.
 	presentation: Presentation,
+	/// The local AP title.
 	local_ap_title: Option<Vec<u32>>,
+	/// The local AE qualifier.
 	local_ae_qualifier: Option<u32>,
+	/// The remote AP title.
 	remote_ap_title: Option<Vec<u32>>,
+	/// The remote AE qualifier.
 	remote_ae_qualifier: Option<u32>,
 }
 
 impl Acse {
+	/// Create a new ACSE layer connection.
 	#[instrument(skip(config))]
 	pub async fn new(config: &ClientConfig) -> Result<Self, AcseError> {
 		let presentation = Presentation::new(config).await?;
@@ -30,6 +42,8 @@ impl Acse {
 			remote_ae_qualifier: config.remote_ae_qualifier,
 		})
 	}
+
+	/// Connect to the remote ACSE.
 	#[instrument(skip(self))]
 	pub async fn connect(&mut self, data: Vec<u8>) -> Result<Vec<u8>, AcseError> {
 		//TODO: Handle Auth parameters
@@ -83,6 +97,8 @@ impl Acse {
 		}
 	}
 
+	/// Split the ACSE layer connection into a read half and a write half.
+	#[must_use]
 	pub fn split(self) -> (AcseReadHalf, AcseWriteHalf) {
 		let (presentation_read, presentation_write) = self.presentation.split();
 		(
@@ -110,11 +126,15 @@ impl ReadHalfConnection for Acse {
 	}
 }
 
+/// ACSE write half.
+#[derive(Debug)]
 pub struct AcseWriteHalf {
+	/// The presentation layer write half.
 	presentation: PresentationWriteHalf,
 }
 
 impl AcseWriteHalf {
+	/// Send data to the remote ACSE.
 	#[instrument(skip_all)]
 	async fn send_data_internal<W: WriteHalfConnection<Error = PresentationError>>(
 		presentation: &mut W,
@@ -133,11 +153,15 @@ impl WriteHalfConnection for AcseWriteHalf {
 	}
 }
 
+/// ACSE read half.
+#[derive(Debug)]
 pub struct AcseReadHalf {
+	/// The presentation layer read half.
 	presentation: PresentationReadHalf,
 }
 
 impl AcseReadHalf {
+	/// Receive data from the remote ACSE.
 	#[instrument(skip_all)]
 	async fn receive_data_internal<R: ReadHalfConnection<Error = PresentationError>>(
 		presentation: &mut R,
@@ -155,6 +179,8 @@ impl ReadHalfConnection for AcseReadHalf {
 	}
 }
 
+#[allow(missing_docs)]
+/// ACSE layer errors
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum AcseError {
@@ -177,7 +203,7 @@ pub enum AcseError {
 	},
 	#[snafu(display("Error decoding AARE"))]
 	DecodeAare {
-		source: rasn::ber::de::DecodeError,
+		source: ber::de::DecodeError,
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
@@ -188,7 +214,7 @@ pub enum AcseError {
 	},
 	#[snafu(display("Error encoding AARQ"))]
 	EncodeAarq {
-		source: rasn::ber::enc::EncodeError,
+		source: ber::enc::EncodeError,
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
@@ -200,6 +226,8 @@ pub enum AcseError {
 }
 
 impl AcseError {
+	/// Get the context of the ACSE error.
+	#[must_use]
 	pub fn get_context(&self) -> &SpanTraceWrapper {
 		match self {
 			AcseError::PresentationLayer { context, .. } => context,

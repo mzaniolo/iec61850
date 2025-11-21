@@ -16,6 +16,15 @@ repos:
       - id: check-executables-have-shebangs
   - repo: local
     hooks:
+      - id: asn1-compiler
+        name: ASN.1 compiler
+        language: system
+        files: "^src/mms/ans1/*.asn$"
+        always_run: true
+        pass_filenames: false
+        entry: cargo +nightly run --bin asn1-compiler
+  - repo: local
+    hooks:
       - id: fmt
         name: fmt
         description: Format files with cargo fmt.
@@ -31,10 +40,10 @@ repos:
         args: ["--workspace", "--all-targets", "--", "-D", "warnings"]
         types: [rust]
         pass_filenames: false
-  # - repo: https://github.com/DevinR528/cargo-sort
-  #   rev: v1.0.4
-  #   hooks:
-  #     - id: cargo-sort
+  - repo: https://github.com/DevinR528/cargo-sort
+    rev: v2.0.2
+    hooks:
+      - id: cargo-sort
   - repo: https://github.com/crate-ci/typos
     rev: v1
     hooks:

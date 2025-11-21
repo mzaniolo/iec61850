@@ -1,53 +1,88 @@
+//! IEC61850 report control block.
+
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
 use time::OffsetDateTime;
 
 use crate::iec61850::data::{Bitstring, Iec61850Data, Iec61850DataError};
 
+/// A  representation of a report control block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportControlBlock {
+	/// The name of the report control block.
 	pub name: String,
-	pub id: String,                           // Index 0
-	pub enabled: bool,                        // Index 1
-	pub dataset: String,                      // Index 2
-	pub config_rev: u32,                      // Index 3
+	/// The id of the report control block.
+	pub id: String, // Index 0
+	/// Whether the report control block is enabled.
+	pub enabled: bool, // Index 1
+	/// The dataset of the report control block.
+	pub dataset: String, // Index 2
+	/// The configuration revision of the report control block.
+	pub config_rev: u32, // Index 3
+	/// The optional fields of the report control block.
 	pub optional_fields: Vec<OptionalFields>, // Index 4
-	pub buffer_time: u32,                     // Index 5
-	pub sequence_number: u32,                 // Index 6
+	/// The buffer time of the report control block.
+	pub buffer_time: u32, // Index 5
+	/// The sequence number of the report control block.
+	pub sequence_number: u32, // Index 6
+	/// The trigger options of the report control block.
 	pub trigger_options: Vec<TriggerOptions>, // Index 7
-	pub integrity_period: u32,                // Index 8
-	pub gi: bool,                             // Index 9
-	pub purge_buffer: bool,                   // Index 10
-	pub entry_id: Vec<u8>,                    // Index 11
-	pub time_of_entry: OffsetDateTime,        // Index 12
-	pub reservation_time: i32,                // Index 13
+	/// The integrity period of the report control block.
+	pub integrity_period: u32, // Index 8
+	/// Whether the report control block is a global integrity report.
+	pub gi: bool, // Index 9
+	/// Whether the report control block is a purge buffer.
+	pub purge_buffer: bool, // Index 10
+	/// The entry id of the report control block.
+	pub entry_id: Vec<u8>, // Index 11
+	/// The time of entry of the report control block.
+	pub time_of_entry: OffsetDateTime, // Index 12
+	/// The reservation time of the report control block.
+	pub reservation_time: i32, // Index 13
 }
 
+/// A trigger option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TriggerOptions {
+	/// The data change trigger option.
 	DataChange = 0x02,
+	/// The quality change trigger option.
 	QualityChange = 0x04,
+	/// The data update trigger option.
 	DataUpdate = 0x08,
+	/// The integrity trigger option.
 	Integrity = 0x10,
+	/// The general interrogation trigger option.
 	Gi = 0x20,
 }
 
+/// A optional field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u16)]
 pub enum OptionalFields {
+	/// The sequence number optional field.
 	SequenceNumber = 0x0002,
+	/// The report timestamp optional field.
 	ReportTimestamp = 0x0004,
+	/// The reason for transmission optional field.
 	ReasonForTransmission = 0x0008,
+	/// The dataset name optional field.
 	DataSetName = 0x0010,
+	/// The data reference optional field.
 	DataReference = 0x0020,
+	/// The buffer overflow optional field.
 	BufferOverflow = 0x0040,
+	/// The entry id optional field.
 	EntryID = 0x0080,
+	/// The configuration revision optional field.
 	ConfigurationRevision = 0x0100,
+	/// The segmentation optional field.
 	Segmentation = 0x0200,
 }
 
 impl ReportControlBlock {
+	/// Create a report control block from data.
 	pub fn from_data(
 		name: String,
 		mut data: Vec<Iec61850Data>,
@@ -129,6 +164,8 @@ impl ReportControlBlock {
 	}
 }
 
+/// The error type for the report control block.
+#[allow(missing_docs)]
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum ReportControlBlockError {
@@ -205,7 +242,7 @@ impl TryFrom<Iec61850Data> for Vec<OptionalFields> {
 impl From<Vec<TriggerOptions>> for Bitstring {
 	fn from(value: Vec<TriggerOptions>) -> Self {
 		Bitstring {
-			bytes: vec![value.into_iter().fold(0u8, |byte, option| byte | option as u8)],
+			bytes: vec![value.into_iter().fold(0_u8, |byte, option| byte | option as u8)],
 			padding: 2,
 		}
 	}
@@ -222,7 +259,7 @@ impl From<Vec<OptionalFields>> for Bitstring {
 		Bitstring {
 			bytes: value
 				.into_iter()
-				.fold(0u16, |byte, option| byte | option as u16)
+				.fold(0_u16, |byte, option| byte | option as u16)
 				.to_le_bytes()
 				.to_vec(),
 			padding: 6,
@@ -236,6 +273,7 @@ impl From<Vec<OptionalFields>> for Iec61850Data {
 	}
 }
 
+#[allow(clippy::unwrap_used, clippy::print_stdout)]
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -244,7 +282,7 @@ mod tests {
 	#[test]
 	fn test_trigger_options() {
 		// In the mms the bit 0 is the MSB. This is why we reverse the bits.
-		let data = Bitstring { bytes: vec![0x4Cu8.reverse_bits()], padding: 2 };
+		let data = Bitstring { bytes: vec![0x4C_u8.reverse_bits()], padding: 2 };
 
 		let options: Vec<TriggerOptions> =
 			Iec61850Data::BitString(data.clone()).try_into().unwrap();
@@ -261,7 +299,7 @@ mod tests {
 		// In the mms the bit 0 is the MSB. This is why we reverse the bits and the
 		// bytes.
 		let data =
-			Bitstring { bytes: vec![0x7bu8.reverse_bits(), 0x80u8.reverse_bits()], padding: 6 };
+			Bitstring { bytes: vec![0x7b_u8.reverse_bits(), 0x80_u8.reverse_bits()], padding: 6 };
 		let options: Vec<OptionalFields> =
 			Iec61850Data::BitString(data.clone()).try_into().unwrap();
 		assert_eq!(

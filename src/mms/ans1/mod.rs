@@ -1,7 +1,15 @@
+//! ANS.1 modules for the IEC61850 MMS part of the protocol.
+//! The rust modules are generated using the asn1-compiler tool.
+//! For running the asn1-compiler tool, run the following command:
+//! `cargo run --bin asn1-compiler`
+
+#![allow(missing_docs)]
+
 pub mod acse;
 pub mod mms;
 pub mod presentation;
 
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
 	use rasn::prelude::*;

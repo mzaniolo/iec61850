@@ -1,3 +1,5 @@
+//! IEC 61850 client implementation.
+
 use std::collections::HashMap;
 
 use rasn::prelude::VisibleString;
@@ -11,7 +13,7 @@ pub mod report;
 
 use crate::{
 	iec61850::{
-		data::Iec61850Data,
+		data::{Iec61850Data, Iec61850DataError},
 		model::{IedModel, LogicalDevice, LogicalNode},
 		rcb::{OptionalFields, ReportControlBlock, ReportControlBlockError, TriggerOptions},
 	},
@@ -21,8 +23,13 @@ use crate::{
 		client::{MmsClient, MmsClientError},
 	},
 };
+
+/// An IEC 61850 client.
+#[derive(Debug)]
 pub struct Iec61850Client {
+	/// The MMS client.
 	client: MmsClient,
+	/// The IEC 61850 model.
 	ied_model: IedModel,
 }
 
@@ -48,10 +55,12 @@ impl Iec61850Client {
 	}
 
 	/// Get the IED model.
-	pub fn model(&self) -> &IedModel {
+	#[must_use]
+	pub const fn model(&self) -> &IedModel {
 		&self.ied_model
 	}
 
+	/// Get the IED model from the ied.
 	#[instrument(skip(self))]
 	async fn get_ied_model(&self) -> Result<IedModel, Iec61850ClientError> {
 		let mut logical_devices = self
@@ -78,7 +87,7 @@ impl Iec61850Client {
 			ld.logical_nodes.extend(logical_nodes);
 
 			let reports = self.get_rcbs(&ld.name).await?;
-			ld.add_reports(reports).expect("Failed to add reports");
+			ld.add_reports(reports).context(Model)?;
 
 			let datasets = self.get_datasets(Some(&ld.name)).await?;
 			let mut dataset_entries = HashMap::new();
@@ -86,7 +95,7 @@ impl Iec61850Client {
 				let entries = self.get_dataset(&dataset, Some(&ld.name)).await?;
 				dataset_entries.insert(dataset, entries);
 			}
-			ld.add_datasets(dataset_entries).expect("Failed to add dataset entries");
+			ld.add_datasets(dataset_entries).context(Model)?;
 		}
 		Ok(IedModel { logical_devices })
 	}
@@ -170,6 +179,7 @@ impl Iec61850Client {
 			.map_err(Into::into)
 	}
 
+	/// Get the data definition of a logical node.
 	#[instrument(skip(self))]
 	async fn get_data_definition(
 		&self,
@@ -185,6 +195,10 @@ impl Iec61850Client {
 		Ok(response.type_specification)
 	}
 
+	/// Create a dataset.
+	/// If path starts with @, the dataset is an association dataset.
+	/// If path does not start with @, the dataset is a logical device dataset
+	/// and the path needs to be like <logical_device>/<dataset_path>.
 	pub async fn create_dataset(
 		&self,
 		path: &str,
@@ -228,6 +242,7 @@ impl Iec61850Client {
 		Ok(())
 	}
 
+	/// Read a dataset.
 	pub async fn read_dataset(
 		&self,
 		dataset: &str,
@@ -245,11 +260,14 @@ impl Iec61850Client {
 		self.client
 			// TODO: Changing from false to true will break stuff. Investigate why.
 			.read(VariableAccessSpecification::variableListName(object_name), false)
-			.await
-			.map_err(Into::into)
-			.map(|data| data.into_iter().map(|d| d.into()).collect())
+			.await?
+			.into_iter()
+			.map(TryInto::try_into)
+			.collect::<Result<_, Iec61850DataError>>()
+			.context(ConvertDataToMmsData)
 	}
 
+	/// Set the data value of a path.
 	pub async fn set_data_value(
 		&self,
 		path: &str,
@@ -265,7 +283,7 @@ impl Iec61850Client {
 		)])
 		.into();
 
-		let list_of_data = vec![data.into()];
+		let list_of_data = vec![data.try_into().context(ConvertDataToMmsData)?];
 
 		self.client.write(variable_access_specification, list_of_data).await.map_err(Into::into)
 	}
@@ -315,8 +333,9 @@ impl Iec61850Client {
 			)
 			.await?
 			.into_iter()
-			.map(|d| d.into())
-			.collect();
+			.map(TryInto::try_into)
+			.collect::<Result<_, Iec61850DataError>>()
+			.context(ConvertDataToMmsData)?;
 
 		match data.pop().context(InvalidDataLength)? {
 			Iec61850Data::Structure(data) => {
@@ -439,13 +458,13 @@ impl Iec61850Client {
 				.collect::<Result<Vec<_>, Iec61850ClientError>>()?,
 		);
 
-		Ok(self
-			.client
+		self.client
 			.read(variable_defs.into(), false)
 			.await?
 			.into_iter()
-			.map(|d| d.into())
-			.collect())
+			.map(TryInto::try_into)
+			.collect::<Result<_, Iec61850DataError>>()
+			.context(ConvertDataToMmsData)
 	}
 
 	/// Read single data from a path.
@@ -456,6 +475,7 @@ impl Iec61850Client {
 	}
 }
 
+/// Convert a string to an identifier.
 fn to_identifier<T: AsRef<str>>(value: T) -> Result<Identifier, Iec61850ClientError> {
 	Ok(Identifier(
 		VisibleString::from_iso646_bytes(value.as_ref().as_bytes())
@@ -463,6 +483,7 @@ fn to_identifier<T: AsRef<str>>(value: T) -> Result<Identifier, Iec61850ClientEr
 	))
 }
 
+/// Split a path into a logical device and a logical node.
 fn split_path(path: &str) -> Result<(&str, &str), Iec61850ClientError> {
 	let split_path = path.split('/').collect::<Vec<&str>>();
 	if split_path.len() != 2 {
@@ -483,6 +504,8 @@ impl std::fmt::Display for ObjectName {
 	}
 }
 
+#[allow(missing_docs)]
+/// The error type for the IEC 61850 client.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum Iec61850ClientError {
@@ -498,6 +521,10 @@ pub enum Iec61850ClientError {
 	InvalidDataLength,
 	/// Error creating report control block.
 	CreateReportControlBlock { source: ReportControlBlockError },
+	/// Error converting data to MMS data.
+	ConvertDataToMmsData { source: Iec61850DataError },
+	/// Error creating the IED model.
+	Model { source: model::ModelError },
 }
 
 impl From<MmsClientError> for Iec61850ClientError {

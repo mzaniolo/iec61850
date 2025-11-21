@@ -10,18 +10,18 @@ homepage = "https://github.com/mzaniolo/iec61850"
 documentation = "https://docs.rs/iec61850"
 readme = "README.md"
 categories = ["network-programming"]
-keywords = [
-    "mms",
-    "61850",
-    "iec61850",
-    "SCADA"
-]
+keywords = ["mms", "61850", "iec61850", "SCADA"]
+
+[[bin]]
+name = "asn1-compiler"
+path = "src/mms/ans1/asn1-compiler.rs"
 
 [dependencies]
 async-trait = "0.1.89"
 lazy_static = "1.5.0"
 num-traits = "0.2.19"
 rasn = "0.28.0"
+rasn-compiler = "0.14.3"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.145"
 snafu = "0.8.6"
@@ -39,13 +39,10 @@ tracing = "0.1.41"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
-[build-dependencies]
-rasn-compiler = "0.14.3"
-
 [dev-dependencies]
 rust-telemetry = { version = "1.2.0", features = ["tracing-error"] }
 
-[workspace.lints.rust]
+[lints.rust]
 dead_code = "warn"
 missing_debug_implementations = "warn"
 missing_docs = "warn"
@@ -55,7 +52,7 @@ unused_extern_crates = "warn"
 unused_import_braces = "warn"
 unused_qualifications = "warn"
 
-[workspace.lints.clippy]
+[lints.clippy]
 tabs_in_doc_comments = "allow"
 branches_sharing_code = "warn"
 cast_lossless = "warn"

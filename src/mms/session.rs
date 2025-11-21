@@ -6,20 +6,25 @@ use tracing::instrument;
 
 use crate::mms::{
 	ClientConfig, ReadHalfConnection, SpanTraceWrapper, WriteHalfConnection,
-	cotp::{self, CotpConnection, CotpError, CotpReadHalf, CotpWriteHalf},
+	cotp::{CotpConnection, CotpError, CotpReadHalf, CotpWriteHalf},
 };
 
 /// Maximum size for session selectors (S-SEL)
 const MAX_SESSION_SELECTOR_SIZE: usize = 16;
 
+/// The ISO Session layer connection.
 #[derive(Debug)]
 pub struct Session {
+	/// The COTP connection.
 	cotp_connection: CotpConnection,
+	/// The local session selector.
 	local_s_sel: SSelector,
+	/// The remote session selector.
 	remote_s_sel: SSelector,
 }
 
 impl Session {
+	/// Create a new ISO Session layer connection.
 	pub async fn new(config: &ClientConfig) -> Result<Self, SessionError> {
 		let cotp_connection = CotpConnection::connect(config).await?;
 		Ok(Self {
@@ -28,6 +33,7 @@ impl Session {
 			remote_s_sel: SSelector::from_bytes(&config.remote_s_sel)?,
 		})
 	}
+	/// Connect to the remote session.
 	#[instrument(skip(self))]
 	pub async fn connect(&mut self, data: &[u8]) -> Result<Vec<u8>, SessionError> {
 		let spdu = ConnectSpdu::new(
@@ -46,6 +52,8 @@ impl Session {
 			InvalidCotpResponse.fail()
 		}
 	}
+	/// Split the connection into a read half and a write half.
+	#[must_use]
 	pub fn split(self) -> (SessionReadHalf, SessionWriteHalf) {
 		let (cotp_read, cotp_write) = self.cotp_connection.split();
 		(SessionReadHalf { cotp_read }, SessionWriteHalf { cotp_write })
@@ -71,18 +79,21 @@ impl ReadHalfConnection for Session {
 	}
 }
 
+/// The write half of the ISO Session layer connection.
 #[derive(Debug)]
 pub struct SessionWriteHalf {
+	/// The write half of the COTP connection.
 	cotp_write: CotpWriteHalf,
 }
 
 impl SessionWriteHalf {
+	/// Send data to the remote session.
 	#[instrument(skip_all)]
 	async fn send_data_internal<W: WriteHalfConnection<Error = CotpError>>(
 		cotp_write: &mut W,
 		data: Vec<u8>,
 	) -> Result<(), SessionError> {
-		let spdu = DataSpdu::new(data.to_vec());
+		let spdu = DataSpdu::new(data.clone());
 		let spdu_bytes = spdu.to_bytes();
 		cotp_write.send_data(spdu_bytes).await?;
 		Ok(())
@@ -99,12 +110,15 @@ impl WriteHalfConnection for SessionWriteHalf {
 	}
 }
 
+/// The read half of the ISO Session layer connection.
 #[derive(Debug)]
 pub struct SessionReadHalf {
+	/// The read half of the COTP connection.
 	cotp_read: CotpReadHalf,
 }
 
 impl SessionReadHalf {
+	/// Receive data from the remote session.
 	#[instrument(skip_all)]
 	async fn receive_data_internal<R: ReadHalfConnection<Error = CotpError>>(
 		cotp_read: &mut R,
@@ -172,11 +186,13 @@ impl TryFrom<u16> for SessionRequirement {
 /// Session selector (S-SEL) - addressing mechanism at the session layer
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SSelector {
+	/// The value of the session selector.
 	pub value: Vec<u8>,
 }
 
 impl SSelector {
-	pub fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
+	/// Parse a session selector from bytes.
+	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
 		if bytes.len() > MAX_SESSION_SELECTOR_SIZE {
 			return InvalidSelectorSize.fail();
 		}
@@ -184,17 +200,13 @@ impl SSelector {
 		Ok(Self { value: bytes.to_vec() })
 	}
 
-	pub fn to_bytes(&self) -> Vec<u8> {
+	/// Convert a session selector to bytes.
+	#[must_use]
+	fn to_bytes(&self) -> Vec<u8> {
 		let mut buffer = Vec::new();
 		buffer.push(self.value.len() as u8);
 		buffer.extend_from_slice(&self.value);
 		buffer
-	}
-	pub fn len(&self) -> usize {
-		self.value.len()
-	}
-	pub fn is_empty(&self) -> bool {
-		self.value.is_empty()
 	}
 }
 
@@ -313,20 +325,28 @@ impl From<u8> for Pi {
 /// Session Protocol Data Unit (SPDU)
 #[derive(Debug, Clone)]
 pub enum Spdu {
+	/// Connect SPDU
 	Connect(ConnectSpdu),
+	/// Accept SPDU
 	Accept(AcceptSpdu),
+	/// Data SPDU
 	Data(DataSpdu),
+	/// Finish SPDU
 	Finish(FinishSpdu),
+	/// Disconnect SPDU
 	Disconnect(DisconnectSpdu),
+	/// Abort SPDU
 	Abort(AbortSpdu),
+	/// Refuse SPDU
 	Refuse(RefuseSpdu),
+	/// Not Finished SPDU
 	NotFinished,
 }
 
 impl Spdu {
 	/// Parse SPDU from bytes
 	#[instrument(skip_all)]
-	pub fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
+	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
 		let length = *bytes.get(1).context(NotEnoughBytes)? as usize;
 
 		match (*bytes.first().context(NotEnoughBytes)?).into() {
@@ -362,8 +382,10 @@ impl Spdu {
 		}
 	}
 
+	#[allow(dead_code)]
 	/// Encode SPDU to bytes
-	pub fn to_bytes(&self) -> Vec<u8> {
+	#[must_use]
+	fn to_bytes(&self) -> Vec<u8> {
 		match self {
 			Self::Connect(spdu) => spdu.to_bytes(),
 			Self::Accept(spdu) => spdu.to_bytes(),
@@ -380,15 +402,22 @@ impl Spdu {
 /// CONNECT SPDU
 #[derive(Debug, Clone)]
 pub struct ConnectSpdu {
+	/// The calling session selector.
 	pub calling_session_selector: Option<SSelector>,
+	/// The called session selector.
 	pub called_session_selector: Option<SSelector>,
+	/// The session requirement.
 	pub session_requirement: SessionRequirement,
+	/// The protocol options.
 	pub protocol_options: u8,
+	/// The user data.
 	pub data: Vec<u8>,
 }
 
 impl ConnectSpdu {
-	pub fn new(
+	/// Create a new Connect SPDU.
+	#[must_use]
+	pub const fn new(
 		calling: SSelector,
 		called: SSelector,
 		requirement: SessionRequirement,
@@ -403,7 +432,9 @@ impl ConnectSpdu {
 		}
 	}
 
-	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
+	/// Parse a Connect SPDU from bytes.
+	#[instrument(skip_all)]
+	pub fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
 		//skip SPDU identifier and length
 		let mut offset = 2;
 
@@ -472,6 +503,8 @@ impl ConnectSpdu {
 		})
 	}
 
+	/// Encode a Connect SPDU to bytes.
+	#[must_use]
 	pub fn to_bytes(&self) -> Vec<u8> {
 		let mut buffer = Vec::new();
 
@@ -484,7 +517,7 @@ impl ConnectSpdu {
 		buffer.push(0);
 
 		// Connection/Accept Item (PGI=5)
-		self.encode_connect_accept_item(&mut buffer, 0);
+		Self::encode_connect_accept_item(&mut buffer, 0);
 
 		// Session User Requirements (PGI=20)
 		self.encode_session_requirement(&mut buffer);
@@ -509,6 +542,8 @@ impl ConnectSpdu {
 		buffer
 	}
 
+	/// Parse a Connect Accept Item from bytes.
+	#[instrument(skip_all)]
 	fn parse_connect_accept_item(bytes: &[u8]) -> Result<u8, SessionError> {
 		let mut offset = 0;
 		let mut has_protocol_options = false;
@@ -575,7 +610,8 @@ impl ConnectSpdu {
 		}
 	}
 
-	fn encode_connect_accept_item(&self, buffer: &mut Vec<u8>, options: u8) {
+	/// Encode a Connect Accept Item to bytes.
+	fn encode_connect_accept_item(buffer: &mut Vec<u8>, options: u8) {
 		buffer.push(Pgi::ConnectAcceptItem as u8);
 		buffer.push(6); // Length
 		buffer.push(Pi::ProtocolOptions as u8);
@@ -586,12 +622,14 @@ impl ConnectSpdu {
 		buffer.push(2); // Version = 2
 	}
 
+	/// Encode a Session Requirement to bytes.
 	fn encode_session_requirement(&self, buffer: &mut Vec<u8>) {
 		buffer.push(Pgi::SessionUserRequirements as u8);
 		buffer.push(2); // Length
 		buffer.extend_from_slice(&(self.session_requirement as u16).to_le_bytes());
 	}
 
+	/// Encode a Calling Session Selector to bytes.
 	fn encode_calling_session_selector(&self, buffer: &mut Vec<u8>) {
 		if let Some(calling_session_selector) = &self.calling_session_selector {
 			buffer.push(Pgi::CallingSessionSelector as u8);
@@ -599,6 +637,7 @@ impl ConnectSpdu {
 		}
 	}
 
+	/// Encode a Called Session Selector to bytes.
 	fn encode_called_session_selector(&self, buffer: &mut Vec<u8>) {
 		if let Some(called_session_selector) = &self.called_session_selector {
 			buffer.push(Pgi::CalledSessionSelector as u8);
@@ -607,17 +646,24 @@ impl ConnectSpdu {
 	}
 }
 
-/// ACCEPT SPDU
+/// Accept SPDU
 #[derive(Debug, Clone)]
 pub struct AcceptSpdu {
+	/// The called session selector.
 	pub called_session_selector: Option<SSelector>,
+	/// The session requirement.
 	pub session_requirement: SessionRequirement,
+	/// The protocol options.
 	pub protocol_options: u8,
+	/// The user data.
 	pub data: Vec<u8>,
 }
 
 impl AcceptSpdu {
-	pub fn new(
+	#[allow(dead_code)]
+	/// Create a new Accept SPDU.
+	#[must_use]
+	const fn new(
 		called: SSelector,
 		requirement: SessionRequirement,
 		protocol_options: u8,
@@ -630,6 +676,8 @@ impl AcceptSpdu {
 			data,
 		}
 	}
+
+	/// Parse an Accept SPDU from bytes.
 	#[instrument(skip_all)]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
 		let connect_spdu = ConnectSpdu::from_bytes(bytes)?;
@@ -641,7 +689,9 @@ impl AcceptSpdu {
 		})
 	}
 
-	pub fn to_bytes(&self) -> Vec<u8> {
+	/// Encode an Accept SPDU to bytes.
+	#[must_use]
+	fn to_bytes(&self) -> Vec<u8> {
 		let mut buffer = Vec::new();
 
 		buffer.push(SpduType::Accept as u8);
@@ -682,17 +732,22 @@ impl AcceptSpdu {
 	}
 }
 
-/// DATA SPDU (fixed 4-byte header)
+/// Data SPDU (fixed 4-byte header)
 #[derive(Debug, Clone)]
 pub struct DataSpdu {
+	/// The user data.
 	pub data: Vec<u8>,
 }
 
 impl DataSpdu {
-	pub fn new(data: Vec<u8>) -> Self {
+	/// Create a new Data SPDU.
+	#[must_use]
+	const fn new(data: Vec<u8>) -> Self {
 		Self { data }
 	}
 
+	/// Parse a Data SPDU from bytes.
+	#[instrument(skip_all)]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
 		if bytes.len() < 4 {
 			return MessageTooShort.fail();
@@ -706,7 +761,9 @@ impl DataSpdu {
 		}
 	}
 
-	pub fn to_bytes(&self) -> Vec<u8> {
+	/// Encode a Data SPDU to bytes.
+	#[must_use]
+	fn to_bytes(&self) -> Vec<u8> {
 		let mut buffer = Vec::with_capacity(4 + self.data.len());
 		buffer.extend_from_slice(&[
 			SpduType::GiveTokenData as u8,
@@ -719,24 +776,32 @@ impl DataSpdu {
 	}
 }
 
-/// FINISH SPDU
+/// Finish SPDU
 #[derive(Debug, Clone)]
 pub struct FinishSpdu {
+	/// The user data.
 	pub data: Vec<u8>,
 }
 
 impl FinishSpdu {
-	pub fn new(user_data: Vec<u8>) -> Self {
+	#[allow(dead_code)]
+	/// Create a new Finish SPDU.
+	#[must_use]
+	const fn new(user_data: Vec<u8>) -> Self {
 		Self { data: user_data }
 	}
 
+	/// Parse a Finish SPDU from bytes.
+	#[instrument(skip_all)]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
 		let mut spdu = Self { data: Vec::new() };
 		spdu.parse_parameters(&bytes[2..])?;
 		Ok(spdu)
 	}
 
-	pub fn to_bytes(&self) -> Vec<u8> {
+	/// Encode a Finish SPDU to bytes.
+	#[must_use]
+	fn to_bytes(&self) -> Vec<u8> {
 		let mut buffer = vec![
 			SpduType::Finish as u8,
 			(2 + self.data.len()) as u8,
@@ -747,6 +812,8 @@ impl FinishSpdu {
 		buffer
 	}
 
+	/// Parse the parameters of a Finish SPDU.
+	#[instrument(skip_all)]
 	fn parse_parameters(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
 		let mut offset = 0;
 
@@ -775,22 +842,29 @@ impl FinishSpdu {
 	}
 }
 
-/// DISCONNECT SPDU
+/// Disconnect SPDU
 #[derive(Debug, Clone)]
 pub struct DisconnectSpdu {
+	/// The user data.
 	pub user_data: Vec<u8>,
 }
 
 impl DisconnectSpdu {
-	pub fn new(user_data: Vec<u8>) -> Self {
+	/// Create a new Disconnect SPDU.
+	#[must_use]
+	pub const fn new(user_data: Vec<u8>) -> Self {
 		Self { user_data }
 	}
 
+	/// Parse a Disconnect SPDU from bytes.
+	#[instrument(skip_all)]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
 		FinishSpdu::from_bytes(bytes).map(|f| Self { user_data: f.data })
 	}
 
-	pub fn to_bytes(&self) -> Vec<u8> {
+	/// Encode a Disconnect SPDU to bytes.
+	#[must_use]
+	fn to_bytes(&self) -> Vec<u8> {
 		let mut buffer = vec![
 			SpduType::Disconnect as u8,
 			(2 + self.user_data.len()) as u8,
@@ -802,17 +876,23 @@ impl DisconnectSpdu {
 	}
 }
 
-/// ABORT SPDU
+/// Abort SPDU
 #[derive(Debug, Clone)]
 pub struct AbortSpdu {
+	/// The user data.
 	pub user_data: Vec<u8>,
 }
 
 impl AbortSpdu {
-	pub fn new(user_data: Vec<u8>) -> Self {
+	#[allow(dead_code)]
+	/// Create a new Abort SPDU.
+	#[must_use]
+	const fn new(user_data: Vec<u8>) -> Self {
 		Self { user_data }
 	}
 
+	/// Parse an Abort SPDU from bytes.
+	#[instrument(skip_all)]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
 		if bytes.len() < 7 {
 			return MessageTooShort.fail();
@@ -821,7 +901,9 @@ impl AbortSpdu {
 		Ok(Self { user_data: bytes[7..].to_vec() })
 	}
 
-	pub fn to_bytes(&self) -> Vec<u8> {
+	/// Encode an Abort SPDU to bytes.
+	#[must_use]
+	fn to_bytes(&self) -> Vec<u8> {
 		let mut buffer = vec![
 			SpduType::Abort as u8,
 			(5 + self.user_data.len()) as u8,
@@ -836,17 +918,23 @@ impl AbortSpdu {
 	}
 }
 
-/// REFUSE SPDU
+/// Refuse SPDU
 #[derive(Debug, Clone)]
 pub struct RefuseSpdu {
+	/// The reason code.
 	pub reason_code: u8,
 }
 
 impl RefuseSpdu {
-	pub fn new(reason_code: u8) -> Self {
+	#[allow(dead_code)]
+	/// Create a new Refuse SPDU.
+	#[must_use]
+	const fn new(reason_code: u8) -> Self {
 		Self { reason_code }
 	}
 
+	/// Parse a Refuse SPDU from bytes.
+	#[instrument(skip_all)]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
 		if bytes.len() < 10 {
 			return MessageTooShort.fail();
@@ -855,7 +943,9 @@ impl RefuseSpdu {
 		Ok(Self { reason_code: bytes[9] })
 	}
 
-	pub fn to_bytes(&self) -> Vec<u8> {
+	/// Encode a Refuse SPDU to bytes.
+	#[must_use]
+	fn to_bytes(&self) -> Vec<u8> {
 		vec![
 			SpduType::Refuse as u8,
 			8, // Length
@@ -872,6 +962,7 @@ impl RefuseSpdu {
 	}
 }
 
+#[allow(missing_docs)]
 /// Session layer errors
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub), context(suffix(false)))]
@@ -903,7 +994,7 @@ pub enum SessionError {
 	},
 	#[snafu(display("Error in COTP layer"))]
 	CotpLayer {
-		source: cotp::CotpError,
+		source: CotpError,
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
@@ -994,6 +1085,8 @@ pub enum SessionError {
 }
 
 impl SessionError {
+	/// Get the context of the session error.
+	#[must_use]
 	pub fn get_context(&self) -> &SpanTraceWrapper {
 		match self {
 			SessionError::CotpLayer { context, .. } => context,
@@ -1022,12 +1115,13 @@ impl SessionError {
 	}
 }
 
-impl From<cotp::CotpError> for SessionError {
-	fn from(error: cotp::CotpError) -> Self {
+impl From<CotpError> for SessionError {
+	fn from(error: CotpError) -> Self {
 		SessionError::CotpLayer { context: Box::new((*error.get_context()).clone()), source: error }
 	}
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1036,13 +1130,13 @@ mod tests {
 	fn test_sselector_new() {
 		let data = [1, 2, 3, 4];
 		let selector = SSelector::from_bytes(&data).unwrap();
-		assert_eq!(selector.len(), 4);
+		assert_eq!(selector.value.len(), 4);
 		assert_eq!(selector.value, &data);
 	}
 
 	#[test]
 	fn test_sselector_too_large() {
-		let data = [0u8; 17]; // Too large
+		let data = [0_u8; 17]; // Too large
 		let result = SSelector::from_bytes(&data);
 		assert!(result.is_err());
 	}
