@@ -1,6 +1,6 @@
 //! IEC 61850 client implementation.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, str::Utf8Error};
 
 use rasn::prelude::VisibleString;
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
@@ -473,6 +473,31 @@ impl Iec61850Client {
 		let path = split_path(path)?;
 		self.read_data_from_ld(path.0, &[path.1]).await
 	}
+
+	/// Read a directory from the IED
+	pub async fn get_directory(&self, path: &str) -> Result<Vec<String>, Iec61850ClientError> {
+		self.client
+			.file_directory(Some(vec![path.to_owned()]))
+			.await?
+			.iter()
+			.map(|d| {
+				Ok(d.file_name
+					.0
+					.iter()
+					.map(|f| str::from_utf8(&f.0).context(ConvertToString))
+					.collect::<Result<Vec<_>, _>>()?
+					.join("/"))
+			})
+			.collect::<Result<Vec<_>, _>>()
+	}
+
+	/// Reads a file from the ied
+	pub async fn read_file(&self, path: &str) -> Result<Vec<u8>, Iec61850ClientError> {
+		let file_id = self.client.file_open(vec![path.to_owned()], None).await?.frsm_id.0;
+		let file = self.client.file_read(file_id).await?;
+		self.client.file_close(file_id).await?;
+		Ok(file)
+	}
 }
 
 /// Convert a string to an identifier.
@@ -525,6 +550,8 @@ pub enum Iec61850ClientError {
 	ConvertDataToMmsData { source: Iec61850DataError },
 	/// Error creating the IED model.
 	Model { source: model::ModelError },
+	/// Error converting to string
+	ConvertToString { source: Utf8Error },
 }
 
 impl From<MmsClientError> for Iec61850ClientError {
