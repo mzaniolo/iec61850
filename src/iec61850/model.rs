@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt as _, Snafu};
 
-use crate::mms::ans1::mms::asn1::TypeSpecification;
+use crate::{iec61850::rcb::ReportControlBlock, mms::ans1::mms::asn1::TypeSpecification};
 
 /// A dataset in the IEC61850 ied model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +29,8 @@ pub struct Report {
 	pub path: String,
 	/// Whether the report is buffered.
 	pub buffered: bool,
+	/// The dataset of the report.
+	pub rcb: ReportControlBlock,
 }
 
 /// An IEC61850 ied model.
@@ -113,8 +115,11 @@ pub enum Node {
 
 impl LogicalDevice {
 	/// Add reports to the logical device.
-	pub fn add_reports(&mut self, reports: Vec<String>) -> Result<(), ModelError> {
-		for report in reports {
+	pub fn add_reports(
+		&mut self,
+		reports: Vec<(String, ReportControlBlock)>,
+	) -> Result<(), ModelError> {
+		for (report, rcb) in reports {
 			let buffered = report.contains("BR");
 			let ln_name =
 				report.split_once("$").with_context(|| InvalidReport { report: report.clone() })?.0;
@@ -125,7 +130,7 @@ impl LogicalDevice {
 				.with_context(|| LogicalNodeNotFound { ln_name })?;
 			ln.reports.insert(
 				report.clone(),
-				Report { path: format!("{}/{}", self.name, report), name: report, buffered },
+				Report { path: format!("{}/{}", self.name, report), name: report, buffered, rcb },
 			);
 		}
 		Ok(())

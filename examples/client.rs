@@ -61,66 +61,66 @@ async fn main() -> Result<(), Whatever> {
 	}
 
 	if let Some(dataset) = &dataset {
-		let data =
-			client.read_dataset(&dataset.path).await.whatever_context("Failed to read dataset")?;
+		let data = client
+			.read_dataset(&dataset.path.as_str().into())
+			.await
+			.whatever_context("Failed to read dataset")?;
 		tracing::info!("Data: {data:#?}");
 	}
 
 	if let Some(rcb) = rcb {
-		let split_path = rcb.path.split('/').collect::<Vec<&str>>();
-		let ld = split_path[0];
-		let rcb = split_path[1];
+		let rcb_path = rcb.path.into();
 
-		let report =
-			client.get_rcb(ld, rcb).await.whatever_context("Failed to get report control block")?;
+		let report = client
+			.get_rcb(&rcb_path)
+			.await
+			.whatever_context("Failed to get report control block")?;
 		tracing::info!("Report control block: {report:#?}");
 
 		if let Some(dataset) = &dataset {
 			client
-				.set_rcb_dataset(ld, rcb, &dataset.path)
+				.set_rcb_dataset(&rcb_path, &dataset.path)
 				.await
 				.whatever_context("Failed to set report control block dataset")?;
 		}
 		client
-			.set_rcb_integrity_period(ld, rcb, 1000)
+			.set_rcb_integrity_period(&rcb_path, 1000)
 			.await
 			.whatever_context("Failed to set report control block integrity period")?;
 		client
-			.set_rcb_buffer_time(ld, rcb, 1000)
+			.set_rcb_buffer_time(&rcb_path, 1000)
 			.await
 			.whatever_context("Failed to set report control block buffer time")?;
 		client
 			.set_rcb_trigger_options(
-				ld,
-				rcb,
+				&rcb_path,
 				vec![TriggerOptions::DataChange, TriggerOptions::Integrity],
 			)
 			.await
 			.whatever_context("Failed to set report control block trigger options")?;
 		client
 			.set_rcb_optional_fields(
-				ld,
-				rcb,
+				&rcb_path,
 				vec![OptionalFields::SequenceNumber, OptionalFields::DataReference],
 			)
 			.await
 			.whatever_context("Failed to set report control block optional fields")?;
 		client
-			.set_rcb_enabled(ld, rcb, true)
+			.set_rcb_enabled(&rcb_path, true)
 			.await
 			.whatever_context("Failed to set report control block enabled")?;
 		client
-			.set_rcb_gi(ld, rcb, true)
+			.set_rcb_gi(&rcb_path, true)
 			.await
 			.whatever_context("Failed to set report control block GI")?;
 
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		client
-			.set_rcb_enabled(ld, rcb, false)
+			.set_rcb_enabled(&rcb_path, false)
 			.await
 			.whatever_context("Failed to set report control block enabled")?;
 		client
-			.set_rcb_trigger_options(ld, rcb, vec![TriggerOptions::DataChange])
+			.set_rcb_trigger_options(&rcb_path, vec![TriggerOptions::DataChange])
 			.await
 			.whatever_context("Failed to set report control block trigger options")?;
 	}

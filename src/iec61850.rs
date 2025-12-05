@@ -1,6 +1,6 @@
 //! IEC 61850 client implementation.
 
-use std::{collections::HashMap, str::Utf8Error};
+use std::{collections::HashMap, fmt, str::Utf8Error};
 
 use rasn::prelude::VisibleString;
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
@@ -87,7 +87,12 @@ impl Iec61850Client {
 			ld.logical_nodes.extend(logical_nodes);
 
 			let reports = self.get_rcbs(&ld.name).await?;
-			ld.add_reports(reports).context(Model)?;
+			let mut report_rcbs = Vec::new();
+			for report in reports {
+				let rcb = self.get_rcb(&(&ld.name, &report).into()).await?;
+				report_rcbs.push((report, rcb));
+			}
+			ld.add_reports(report_rcbs).context(Model)?;
 
 			let datasets = self.get_datasets(Some(&ld.name)).await?;
 			let mut dataset_entries = HashMap::new();
@@ -201,16 +206,17 @@ impl Iec61850Client {
 	/// and the path needs to be like <logical_device>/<dataset_path>.
 	pub async fn create_dataset(
 		&self,
-		path: &str,
+		path: &ObjectPath,
 		entries: Vec<String>,
 	) -> Result<(), Iec61850ClientError> {
+		let path_str = path.to_string();
 		// Association dataset can have elements from multiple logical devices while
 		// dataset inside a logical device can only have elements from that logical
 		// device.
-		let (variable_list_name, logical_device) = if path.starts_with("@") {
-			(ObjectName::aa_specific(to_identifier(path.trim_start_matches("@"))?), None)
+		let (variable_list_name, logical_device) = if path_str.starts_with("@") {
+			(ObjectName::aa_specific(to_identifier(path_str.trim_start_matches("@"))?), None)
 		} else {
-			let path = split_path(path)?;
+			let path = path.get_split_path()?;
 			(
 				ObjectName::domain_specific(ObjectNameDomainSpecific::new(
 					to_identifier(path.0)?,
@@ -245,12 +251,13 @@ impl Iec61850Client {
 	/// Read a dataset.
 	pub async fn read_dataset(
 		&self,
-		dataset: &str,
+		dataset: &ObjectPath,
 	) -> Result<Vec<Iec61850Data>, Iec61850ClientError> {
-		let object_name = if dataset.starts_with("@") {
-			ObjectName::aa_specific(to_identifier(dataset.trim_start_matches("@"))?)
+		let dataset_str = dataset.to_string();
+		let object_name = if dataset_str.starts_with("@") {
+			ObjectName::aa_specific(to_identifier(dataset_str.trim_start_matches("@"))?)
 		} else {
-			let path = split_path(dataset)?;
+			let path = dataset.get_split_path()?;
 			ObjectName::domain_specific(ObjectNameDomainSpecific::new(
 				to_identifier(path.0)?,
 				to_identifier(path.1)?,
@@ -270,10 +277,10 @@ impl Iec61850Client {
 	/// Set the data value of a path.
 	pub async fn set_data_value(
 		&self,
-		path: &str,
+		path: &ObjectPath,
 		data: Iec61850Data,
 	) -> Result<(), Iec61850ClientError> {
-		let path = split_path(path)?;
+		let path = path.get_split_path()?;
 
 		let variable_access_specification = VariableDefs(vec![AnonymousVariableDefs::new(
 			VariableSpecification::name(ObjectName::domain_specific(
@@ -316,9 +323,9 @@ impl Iec61850Client {
 	#[instrument(skip(self))]
 	pub async fn get_rcb(
 		&self,
-		logical_device: &str,
-		report_control_block: &str,
+		path: &ObjectPath,
 	) -> Result<ReportControlBlock, Iec61850ClientError> {
+		let (logical_device, report_control_block) = path.get_split_path()?;
 		let object_name = ObjectName::domain_specific(ObjectNameDomainSpecific::new(
 			to_identifier(logical_device)?,
 			to_identifier(report_control_block)?,
@@ -348,92 +355,73 @@ impl Iec61850Client {
 
 	/// Set the GI of a report control block.
 	#[instrument(skip(self))]
-	pub async fn set_rcb_gi(
-		&self,
-		logical_device: &str,
-		report_control_block: &str,
-		gi: bool,
-	) -> Result<(), Iec61850ClientError> {
+	pub async fn set_rcb_gi(&self, path: &ObjectPath, gi: bool) -> Result<(), Iec61850ClientError> {
 		let data = Iec61850Data::Bool(gi);
-		self.set_data_value(&format!("{logical_device}/{report_control_block}$GI"), data).await
+		self.set_data_value(&format!("{path}$GI").into(), data).await
 	}
 
 	/// Set the enabled state of a report control block.
 	#[instrument(skip(self))]
 	pub async fn set_rcb_enabled(
 		&self,
-		logical_device: &str,
-		report_control_block: &str,
+		path: &ObjectPath,
 		enabled: bool,
 	) -> Result<(), Iec61850ClientError> {
 		let data = Iec61850Data::Bool(enabled);
-		self.set_data_value(&format!("{logical_device}/{report_control_block}$RptEna"), data).await
+		self.set_data_value(&format!("{path}$RptEna").into(), data).await
 	}
 
 	/// Set the dataset of a report control block.
 	#[instrument(skip(self))]
 	pub async fn set_rcb_dataset(
 		&self,
-		logical_device: &str,
-		report_control_block: &str,
+		path: &ObjectPath,
 		dataset: &str,
 	) -> Result<(), Iec61850ClientError> {
 		let data = Iec61850Data::String(dataset.trim_start_matches("@").to_owned());
-		self.set_data_value(&format!("{logical_device}/{report_control_block}$DatSet"), data).await
+		self.set_data_value(&format!("{path}$DatSet").into(), data).await
 	}
 
 	/// Set the integrity period of a report control block.
 	#[instrument(skip(self))]
 	pub async fn set_rcb_integrity_period(
 		&self,
-		logical_device: &str,
-		report_control_block: &str,
+		path: &ObjectPath,
 		integrity_period: u32,
 	) -> Result<(), Iec61850ClientError> {
 		let data = Iec61850Data::Unsigned(integrity_period);
-		self.set_data_value(&format!("{logical_device}/{report_control_block}$IntgPd"), data).await
+		self.set_data_value(&format!("{path}$IntgPd").into(), data).await
 	}
 
 	/// Set the buffer time of a report control block.
 	#[instrument(skip(self))]
 	pub async fn set_rcb_buffer_time(
 		&self,
-		logical_device: &str,
-		report_control_block: &str,
+		path: &ObjectPath,
 		buffer_time: u32,
 	) -> Result<(), Iec61850ClientError> {
 		let data = Iec61850Data::Unsigned(buffer_time);
-		self.set_data_value(&format!("{logical_device}/{report_control_block}$BufTm"), data).await
+		self.set_data_value(&format!("{path}$BufTm").into(), data).await
 	}
 
 	/// Set the trigger options of a report control block.
 	#[instrument(skip(self))]
 	pub async fn set_rcb_trigger_options(
 		&self,
-		logical_device: &str,
-		report_control_block: &str,
+		path: &ObjectPath,
 		trigger_options: Vec<TriggerOptions>,
 	) -> Result<(), Iec61850ClientError> {
-		self.set_data_value(
-			&format!("{logical_device}/{report_control_block}$TrgOps"),
-			trigger_options.into(),
-		)
-		.await
+		self.set_data_value(&format!("{path}$TrgOps").into(), trigger_options.into()).await
 	}
 
 	/// Set the optional fields of a report control block.
 	#[instrument(skip(self))]
 	pub async fn set_rcb_optional_fields(
 		&self,
-		logical_device: &str,
-		report_control_block: &str,
+		path: &ObjectPath,
 		optional_fields: Vec<OptionalFields>,
 	) -> Result<(), Iec61850ClientError> {
-		self.set_data_value(
-			&format!("{logical_device}/{report_control_block}$OptFlds"),
-			optional_fields.into(),
-		)
-		.await
+		self.set_data_value(&format!("{path}$OptFlds").into(), optional_fields.into()).await
 	}
 
 	/// Read data from a logical device.
@@ -517,8 +505,8 @@ fn split_path(path: &str) -> Result<(&str, &str), Iec61850ClientError> {
 	Ok((split_path[0], split_path[1]))
 }
 
-impl std::fmt::Display for ObjectName {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ObjectName {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			ObjectName::vmd_specific(name) => write!(f, "{}", name.0),
 			ObjectName::domain_specific(name) => {
@@ -557,5 +545,68 @@ pub enum Iec61850ClientError {
 impl From<MmsClientError> for Iec61850ClientError {
 	fn from(error: MmsClientError) -> Self {
 		Iec61850ClientError::Client { source: error }
+	}
+}
+
+/// A path to an object in the IED.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum ObjectPath {
+	/// A full path to an object in the IED.
+	FullPath(String),
+	/// A path to an object in a logical device.
+	FromLogicalDevice {
+		/// The name of the logical device.
+		logical_device: String,
+		/// The path to the object in the logical device.
+		path: String,
+	},
+}
+
+impl ObjectPath {
+	/// Split a path into a logical device and a logical node.
+	fn get_split_path(&self) -> Result<(&str, &str), Iec61850ClientError> {
+		match self {
+			Self::FullPath(path) => {
+				let split_path = path.split('/').collect::<Vec<&str>>();
+				if split_path.len() != 2 {
+					return InvalidPath.fail();
+				}
+				Ok((split_path[0], split_path[1]))
+			}
+			Self::FromLogicalDevice { logical_device, path } => Ok((logical_device, path)),
+		}
+	}
+}
+
+impl From<&str> for ObjectPath {
+	fn from(value: &str) -> Self {
+		Self::FullPath(value.to_owned())
+	}
+}
+
+impl From<String> for ObjectPath {
+	fn from(value: String) -> Self {
+		Self::FullPath(value)
+	}
+}
+
+impl<T, U> From<(T, U)> for ObjectPath
+where
+	T: Into<String>,
+	U: Into<String>,
+{
+	fn from((logical_device, path): (T, U)) -> Self {
+		Self::FromLogicalDevice { logical_device: logical_device.into(), path: path.into() }
+	}
+}
+
+impl fmt::Display for ObjectPath {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::FullPath(path) => write!(f, "{}", path),
+			Self::FromLogicalDevice { logical_device, path } => {
+				write!(f, "{}/{}", logical_device, path)
+			}
+		}
 	}
 }

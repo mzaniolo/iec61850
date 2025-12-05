@@ -27,34 +27,49 @@ pub struct ClientConfig {
 	/// The port of the server.
 	pub port: u16,
 	/// The local transport selector.
+	#[serde(default)]
 	pub local_t_sel: Vec<u8>,
 	/// The remote transport selector.
+	#[serde(default)]
 	pub remote_t_sel: Vec<u8>,
 	/// The TPDU size.
+	#[serde(default)]
 	pub tpdu_size: u32,
 	/// The local session selector.
+	#[serde(default)]
 	pub local_s_sel: Vec<u8>,
 	/// The remote session selector.
+	#[serde(default)]
 	pub remote_s_sel: Vec<u8>,
 	/// The local presentation selector.
+	#[serde(default)]
 	pub local_p_sel: Vec<u8>,
 	/// The remote presentation selector.
+	#[serde(default)]
 	pub remote_p_sel: Vec<u8>,
 	/// The local AP title.
+	#[serde(default)]
 	pub local_ap_title: Option<Vec<u32>>,
 	/// The remote AP title.
+	#[serde(default)]
 	pub remote_ap_title: Option<Vec<u32>>,
 	/// The local AE qualifier.
+	#[serde(default)]
 	pub local_ae_qualifier: Option<u32>,
 	/// The remote AE qualifier.
+	#[serde(default)]
 	pub remote_ae_qualifier: Option<u32>,
 	/// The maximum number of outstanding calling services.
+	#[serde(default)]
 	pub max_serv_outstanding_calling: i16,
 	/// The maximum number of outstanding called services.
+	#[serde(default)]
 	pub max_serv_outstanding_called: i16,
 	/// The data structure nesting level.
+	#[serde(default)]
 	pub data_structure_nesting_level: i8,
 	/// The maximum PDU size.
+	#[serde(default)]
 	pub max_pdu_size: i32,
 	/// The TLS configuration.
 	#[serde(default)]
