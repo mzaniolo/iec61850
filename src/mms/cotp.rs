@@ -52,9 +52,9 @@ impl CotpConnection {
 		config: &ClientConfig,
 	) -> Result<Self, CotpError> {
 		let options = vec![
-			CotpOptions::TpduSize(TpduSize::new(config.tpdu_size)),
-			CotpOptions::TSelDst(TselDst { value: config.remote_t_sel.clone() }),
-			CotpOptions::TSelSrc(TselSrc { value: config.local_t_sel.clone() }),
+			CotpOptions::TpduSize(TpduSize::new(config.connection.tpdu_size)),
+			CotpOptions::TSelDst(TselDst { value: config.connection.remote_t_sel.clone() }),
+			CotpOptions::TSelSrc(TselSrc { value: config.connection.local_t_sel.clone() }),
 		];
 
 		let local_ref = 1;

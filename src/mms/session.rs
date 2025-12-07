@@ -29,8 +29,8 @@ impl Session {
 		let cotp_connection = CotpConnection::connect(config).await?;
 		Ok(Self {
 			cotp_connection,
-			local_s_sel: SSelector::from_bytes(&config.local_s_sel)?,
-			remote_s_sel: SSelector::from_bytes(&config.remote_s_sel)?,
+			local_s_sel: SSelector::from_bytes(&config.connection.local_s_sel)?,
+			remote_s_sel: SSelector::from_bytes(&config.connection.remote_s_sel)?,
 		})
 	}
 	/// Connect to the remote session.

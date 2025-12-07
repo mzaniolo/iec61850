@@ -76,10 +76,10 @@ impl Presentation {
 		Ok(Self {
 			session,
 			local_p_sel: CallingPresentationSelector(PresentationSelector(OctetString::from(
-				config.local_p_sel.as_ref(),
+				config.connection.local_p_sel.as_ref(),
 			))),
 			remote_p_sel: CalledPresentationSelector(PresentationSelector(OctetString::from(
-				config.remote_p_sel.as_ref(),
+				config.connection.remote_p_sel.as_ref(),
 			))),
 		})
 	}

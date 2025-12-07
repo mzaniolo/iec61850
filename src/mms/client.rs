@@ -50,10 +50,10 @@ impl MmsClient {
 	) -> Result<Self, MmsClientError> {
 		let mut acse = Acse::new(config).await?;
 
-		let max_serv_outstanding_called = config.max_serv_outstanding_called;
-		let max_serv_outstanding_calling = config.max_serv_outstanding_calling;
-		let data_structure_nesting_level = config.data_structure_nesting_level;
-		let max_pdu_size = config.max_pdu_size;
+		let max_serv_outstanding_called = config.connection.max_serv_outstanding_called;
+		let max_serv_outstanding_calling = config.connection.max_serv_outstanding_calling;
+		let data_structure_nesting_level = config.connection.data_structure_nesting_level;
+		let max_pdu_size = config.connection.max_pdu_size;
 
 		let request = MMSpdu::initiate_RequestPDU(InitiateRequestPDU::new(
 			Some(Integer32(max_pdu_size)),

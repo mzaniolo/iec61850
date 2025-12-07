@@ -36,10 +36,10 @@ impl Acse {
 		let presentation = Presentation::new(config).await?;
 		Ok(Self {
 			presentation,
-			local_ap_title: config.local_ap_title.clone(),
-			local_ae_qualifier: config.local_ae_qualifier,
-			remote_ap_title: config.remote_ap_title.clone(),
-			remote_ae_qualifier: config.remote_ae_qualifier,
+			local_ap_title: config.connection.local_ap_title.clone(),
+			local_ae_qualifier: config.connection.local_ae_qualifier,
+			remote_ap_title: config.connection.remote_ap_title.clone(),
+			remote_ae_qualifier: config.connection.remote_ae_qualifier,
 		})
 	}
 
