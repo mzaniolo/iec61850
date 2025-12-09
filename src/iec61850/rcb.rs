@@ -6,9 +6,18 @@ use time::OffsetDateTime;
 
 use crate::iec61850::data::{Bitstring, Iec61850Data, Iec61850DataError};
 
-/// A  representation of a report control block.
+/// A representation of a report control block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReportControlBlock {
+pub enum ReportControlBlock {
+	/// A buffered report control block.
+	Buffered(BufferedReportControlBlock),
+	/// A unbuffered report control block.
+	Unbuffered(UnbufferedReportControlBlock),
+}
+
+/// A  representation of a buffered report control block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferedReportControlBlock {
 	/// The name of the report control block.
 	pub name: String,
 	/// The id of the report control block.
@@ -39,6 +48,35 @@ pub struct ReportControlBlock {
 	pub time_of_entry: OffsetDateTime, // Index 12
 	/// The reservation time of the report control block.
 	pub reservation_time: i32, // Index 13
+}
+
+/// A  representation of a unbuffered report control block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnbufferedReportControlBlock {
+	/// The name of the report control block.
+	pub name: String,
+	/// The id of the report control block.
+	pub id: String, // Index 0
+	/// Whether the report control block is enabled.
+	pub enabled: bool, // Index 1
+	/// Whether the report control block is reserved.
+	pub reservation: bool, // Index 2
+	/// The dataset of the report control block.
+	pub dataset: String, // Index 3
+	/// The configuration revision of the report control block.
+	pub config_rev: u32, // Index 4
+	/// The optional fields of the report control block.
+	pub optional_fields: Vec<OptionalFields>, // Index 5
+	/// The buffer time of the report control block.
+	pub buffer_time: u32, // Index 6
+	/// The sequence number of the report control block.
+	pub sequence_number: u32, // Index 7
+	/// The trigger options of the report control block.
+	pub trigger_options: Vec<TriggerOptions>, // Index 8
+	/// The integrity period of the report control block.
+	pub integrity_period: u32, // Index 9
+	/// Whether the report control block is a global integrity report.
+	pub gi: bool, // Index 10
 }
 
 /// A trigger option.
@@ -81,7 +119,7 @@ pub enum OptionalFields {
 	Segmentation = 0x0200,
 }
 
-impl ReportControlBlock {
+impl BufferedReportControlBlock {
 	/// Create a report control block from data.
 	pub fn from_data(
 		name: String,
@@ -164,6 +202,90 @@ impl ReportControlBlock {
 	}
 }
 
+impl UnbufferedReportControlBlock {
+	/// Create a report control block from data.
+	pub fn from_data(
+		name: String,
+		mut data: Vec<Iec61850Data>,
+	) -> Result<Self, ReportControlBlockError> {
+		Ok(Self {
+			name,
+			// The values come in a specific order
+			gi: data
+				.pop()
+				.context(MissingField { field: "gi" })?
+				.try_into()
+				.context(InvalidConversion { field: "gi" })?,
+			integrity_period: data
+				.pop()
+				.context(MissingField { field: "integrity_period" })?
+				.try_into()
+				.context(InvalidConversion { field: "integrity_period" })?,
+			trigger_options: data
+				.pop()
+				.context(MissingField { field: "trigger_options" })?
+				.try_into()
+				.context(InvalidConversion { field: "trigger_options" })?,
+			sequence_number: data
+				.pop()
+				.context(MissingField { field: "sequence_number" })?
+				.try_into()
+				.context(InvalidConversion { field: "sequence_number" })?,
+			buffer_time: data
+				.pop()
+				.context(MissingField { field: "buffer_time" })?
+				.try_into()
+				.context(InvalidConversion { field: "buffer_time" })?,
+			optional_fields: data
+				.pop()
+				.context(MissingField { field: "optional_fields" })?
+				.try_into()
+				.context(InvalidConversion { field: "optional_fields" })?,
+			config_rev: data
+				.pop()
+				.context(MissingField { field: "config_rev" })?
+				.try_into()
+				.context(InvalidConversion { field: "config_rev" })?,
+			dataset: data
+				.pop()
+				.context(MissingField { field: "dataset" })?
+				.try_into()
+				.context(InvalidConversion { field: "dataset" })?,
+			reservation: data
+				.pop()
+				.context(MissingField { field: "reservation" })?
+				.try_into()
+				.context(InvalidConversion { field: "reservation" })?,
+			enabled: data
+				.pop()
+				.context(MissingField { field: "enabled" })?
+				.try_into()
+				.context(InvalidConversion { field: "enabled" })?,
+			id: data
+				.pop()
+				.context(MissingField { field: "id" })?
+				.try_into()
+				.context(InvalidConversion { field: "id" })?,
+		})
+	}
+}
+
+impl ReportControlBlock {
+	/// Create a report control block from data.
+	pub fn from_data(
+		name: String,
+		data: Vec<Iec61850Data>,
+	) -> Result<Self, ReportControlBlockError> {
+		if data.len() == 14 {
+			BufferedReportControlBlock::from_data(name, data).map(ReportControlBlock::Buffered)
+		} else if data.len() == 11 {
+			UnbufferedReportControlBlock::from_data(name, data).map(ReportControlBlock::Unbuffered)
+		} else {
+			InvalidDataLength { length: data.len() }.fail()
+		}
+	}
+}
+
 /// The error type for the report control block.
 #[allow(missing_docs)]
 #[derive(Debug, Snafu)]
@@ -173,6 +295,8 @@ pub enum ReportControlBlockError {
 	MissingField { field: String },
 	#[snafu(display("Invalid conversion for field: {}", field))]
 	InvalidConversion { field: String, source: Iec61850DataError },
+	#[snafu(display("Invalid data length for report control block. Length: {}", length))]
+	InvalidDataLength { length: usize },
 }
 
 impl TryFrom<Iec61850Data> for Vec<TriggerOptions> {

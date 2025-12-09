@@ -120,7 +120,7 @@ impl LogicalDevice {
 		reports: Vec<(String, ReportControlBlock)>,
 	) -> Result<(), ModelError> {
 		for (report, rcb) in reports {
-			let buffered = report.contains("BR");
+			let buffered = matches!(rcb, ReportControlBlock::Buffered(_));
 			let ln_name =
 				report.split_once("$").with_context(|| InvalidReport { report: report.clone() })?.0;
 			let ln = self

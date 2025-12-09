@@ -21,8 +21,9 @@ use tracing_subscriber::{
 };
 
 #[tokio::main]
+#[snafu::report]
 async fn main() -> Result<(), Whatever> {
-	let filter = EnvFilter::from("info");
+	let filter = EnvFilter::from("debug");
 	let layer = tracing_subscriber::fmt::layer().with_filter(filter);
 	tracing_subscriber::registry()
 		.with(layer)
