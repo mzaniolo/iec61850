@@ -176,9 +176,16 @@ impl CotpReadHalf {
 		let length =
 			u16::from_be_bytes(buffer[2..TPKT_HEADER_SIZE].try_into().context(SizedSlice)?);
 
+		let payload_len = (length as usize)
+			.checked_sub(TPKT_HEADER_SIZE)
+			.context(TpktLengthTooShort { length })?;
+		if payload_len > COTP_MAX_TPDU_SIZE as usize {
+			return TpktLengthTooLarge { length }.fail();
+		}
+
 		//TODO: This needs to be optimized. Make this static and always clean it before
 		// use.
-		let mut buffer = vec![0; length as usize - TPKT_HEADER_SIZE];
+		let mut buffer = vec![0; payload_len];
 		connection
 			.read_exact(&mut buffer)
 			.await
@@ -550,30 +557,31 @@ fn bytes_to_options(bytes: &[u8]) -> Result<Vec<CotpOptions>, CotpError> {
 	while start < bytes.len() {
 		match *bytes.get(start).context(NotEnoughBytes)? {
 			0xc0 => {
+				let end = start.checked_add(3).context(NotEnoughBytes)?;
 				let tpdu_size = TpduSize::from_bytes(
-					bytes
-						.get(start..start + 3)
-						.context(NotEnoughBytes)?
-						.try_into()
-						.context(SizedSlice)?,
+					bytes.get(start..end).context(NotEnoughBytes)?.try_into().context(SizedSlice)?,
 				)?;
 				options.push(CotpOptions::TpduSize(tpdu_size));
-				start += 3;
+				start = end;
 			}
 			0xc2 => {
-				let len = bytes[start + 1] as usize;
-				let ts_el_dst = TselDst::from_bytes(&bytes[start..start + len + 2])?;
+				let len = *bytes.get(start + 1).context(NotEnoughBytes)? as usize;
+				let end = start.checked_add(len + 2).context(NotEnoughBytes)?;
+				let ts_el_dst =
+					TselDst::from_bytes(bytes.get(start..end).context(NotEnoughBytes)?)?;
 				options.push(CotpOptions::TSelDst(ts_el_dst));
-				start += len + 2;
+				start = end;
 			}
 			0xc1 => {
-				let len = bytes[start + 1] as usize;
-				let ts_el_src = TselSrc::from_bytes(&bytes[start..start + len + 2])?;
+				let len = *bytes.get(start + 1).context(NotEnoughBytes)? as usize;
+				let end = start.checked_add(len + 2).context(NotEnoughBytes)?;
+				let ts_el_src =
+					TselSrc::from_bytes(bytes.get(start..end).context(NotEnoughBytes)?)?;
 				options.push(CotpOptions::TSelSrc(ts_el_src));
-				start += len + 2;
+				start = end;
 			}
-			0xc6 if bytes[start + 1] == 1 => {
-				start += 3;
+			0xc6 if *bytes.get(start + 1).context(NotEnoughBytes)? == 1 => {
+				start = start.checked_add(3).context(NotEnoughBytes)?;
 			}
 			_ => {
 				return InvalidTpduOption.fail();
@@ -655,8 +663,11 @@ impl TpduSize {
 		if bytes[1] != 0x01 {
 			return InvalidTpduSize.fail();
 		}
-		//TODO: I think we need to do a shift here
 		let value = bytes[2];
+		// RFC 905 / ISO 8073 class 0 limits the size code to 2^6..=2^13 bytes.
+		if !(6..=13).contains(&value) {
+			return InvalidTpduSizeValue { value }.fail();
+		}
 		Ok(Self { value })
 	}
 	/// Convert a TPDU size option to a byte array.
@@ -762,6 +773,18 @@ pub enum CotpError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
+	#[snafu(display("TPKT length {length} is smaller than the 4-byte header"))]
+	TpktLengthTooShort {
+		length: u16,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
+	#[snafu(display("TPKT length {length} exceeds the maximum TPDU size"))]
+	TpktLengthTooLarge {
+		length: u16,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	#[snafu(display("Invalid TPDU option"))]
 	InvalidTpduOption {
 		#[snafu(implicit)]
@@ -769,6 +792,12 @@ pub enum CotpError {
 	},
 	#[snafu(display("Invalid TPDU size option"))]
 	InvalidTpduSize {
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
+	#[snafu(display("Invalid TPDU size value {value} (must be in 6..=13)"))]
+	InvalidTpduSizeValue {
+		value: u8,
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
@@ -824,8 +853,11 @@ impl CotpError {
 			CotpError::WrongCotpType { context } => context,
 			CotpError::ConnectionFailed { context } => context,
 			CotpError::InvalidTpktVersion { context } => context,
+			CotpError::TpktLengthTooShort { context, .. } => context,
+			CotpError::TpktLengthTooLarge { context, .. } => context,
 			CotpError::InvalidTpduOption { context } => context,
 			CotpError::InvalidTpduSize { context } => context,
+			CotpError::InvalidTpduSizeValue { context, .. } => context,
 			CotpError::InvalidTselDst { context } => context,
 			CotpError::InvalidTselSrc { context } => context,
 			CotpError::InvalidEot { context } => context,
@@ -1005,6 +1037,50 @@ mod tests {
 
 		let invalid_bytes = [0xc0, 0x02, 13]; // Wrong length
 		assert!(TpduSize::from_bytes(invalid_bytes).is_err());
+	}
+
+	#[test]
+	fn test_tpdu_size_invalid_value_rejected() {
+		// Per RFC 905 the size code must be in 6..=13. Values outside that range
+		// would overflow the `1 << value` shift in get_value().
+		assert!(matches!(
+			TpduSize::from_bytes([0xc0, 0x01, 5]),
+			Err(CotpError::InvalidTpduSizeValue { value: 5, .. })
+		));
+		assert!(matches!(
+			TpduSize::from_bytes([0xc0, 0x01, 14]),
+			Err(CotpError::InvalidTpduSizeValue { value: 14, .. })
+		));
+		assert!(matches!(
+			TpduSize::from_bytes([0xc0, 0x01, 32]),
+			Err(CotpError::InvalidTpduSizeValue { value: 32, .. })
+		));
+		// Boundaries are accepted.
+		assert!(TpduSize::from_bytes([0xc0, 0x01, 6]).is_ok());
+		assert!(TpduSize::from_bytes([0xc0, 0x01, 13]).is_ok());
+	}
+
+	#[test]
+	fn test_bytes_to_options_truncated_does_not_panic() {
+		// 0xc2 (TSelDst) claiming 8 bytes of value but only 2 follow.
+		let truncated = [0xc2, 0x08, 0x00, 0x01];
+		assert!(bytes_to_options(&truncated).is_err());
+
+		// 0xc1 (TSelSrc) with the length byte missing.
+		let truncated = [0xc1];
+		assert!(bytes_to_options(&truncated).is_err());
+
+		// 0xc0 (TPDU size) header only — needs 3 bytes total.
+		let truncated = [0xc0, 0x01];
+		assert!(bytes_to_options(&truncated).is_err());
+
+		// 0xc6 vendor option with the length byte missing.
+		let truncated = [0xc6];
+		assert!(bytes_to_options(&truncated).is_err());
+
+		// Length that would overflow start + len + 2.
+		let overflow = [0xc2, 0xff];
+		assert!(bytes_to_options(&overflow).is_err());
 	}
 
 	#[test]
@@ -1227,6 +1303,27 @@ mod tests {
 	fn test_cotp_insufficient_bytes() {
 		let short_bytes = [0x02]; // Too short
 		assert!(Cotp::from_bytes(&short_bytes).is_err());
+	}
+
+	#[tokio::test]
+	async fn test_read_tpkt_length_too_short_does_not_panic() {
+		// TPKT header with length=3 (less than the 4-byte header itself).
+		// Before the fix this would underflow `length as usize - TPKT_HEADER_SIZE`
+		// and panic; it must now return an error cleanly.
+		let bytes: &[u8] = &[0x03, 0x00, 0x00, 0x03];
+		let mut cursor = bytes;
+		let result = CotpReadHalf::read_tpkt(&mut cursor).await;
+		assert!(matches!(result, Err(CotpError::TpktLengthTooShort { length: 3, .. })));
+	}
+
+	#[tokio::test]
+	async fn test_read_tpkt_length_too_large_does_not_overallocate() {
+		// TPKT length larger than COTP_MAX_TPDU_SIZE (8192) — must be rejected
+		// before attempting the payload allocation.
+		let bytes: &[u8] = &[0x03, 0x00, 0xff, 0xff];
+		let mut cursor = bytes;
+		let result = CotpReadHalf::read_tpkt(&mut cursor).await;
+		assert!(matches!(result, Err(CotpError::TpktLengthTooLarge { length: 0xffff, .. })));
 	}
 
 	#[test]

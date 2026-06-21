@@ -23,6 +23,29 @@ use crate::{
 const VERSION_NUMBER: i16 = 1;
 /// The minimum PDU size.
 const MIN_PDU_SIZE: i32 = 64;
+
+/// Result returned by the connection handler to a waiting caller. `Ok`
+/// carries the service response; `Err` carries the structured failure
+/// reported by the peer (Confirmed-Error or Reject PDU).
+type ServiceResult = Result<ConfirmedServiceResponse, ServiceFailure>;
+
+/// Structured server-side failure for a confirmed service request, carried
+/// back to the caller instead of an opaque dropped-channel error.
+#[derive(Debug, Clone)]
+pub enum ServiceFailure {
+	/// The peer answered with a Confirmed-ErrorPDU.
+	ConfirmedError {
+		/// Optional modifier position from the Confirmed-Error PDU.
+		modifier_position: Option<u32>,
+		/// The service error from the Confirmed-Error PDU.
+		service_error: ServiceError,
+	},
+	/// The peer answered with a RejectPDU.
+	Rejected {
+		/// Reject reason from the Reject PDU.
+		reason: RejectPDURejectReason,
+	},
+}
 /// The service support options.
 const SERVICE_SUPPORT_OPTIONS: [u8; 11] =
 	[0xee, 0x1c, 0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x79, 0xef, 0x18];
@@ -38,7 +61,7 @@ pub struct MmsClient {
 	// data_structure_nesting_level: i8,
 	// max_pdu_size: i32,
 	/// The sender for the confirmed service requests.
-	tx: mpsc::Sender<(ConfirmedServiceRequest, oneshot::Sender<ConfirmedServiceResponse>)>,
+	tx: mpsc::Sender<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
 }
 
 impl MmsClient {
@@ -130,7 +153,10 @@ impl MmsClient {
 	) -> Result<ConfirmedServiceResponse, MmsClientError> {
 		let (tx, rx) = oneshot::channel();
 		self.tx.send((request, tx)).await.context(SendRequest)?;
-		rx.await.context(ReceiveResponse)
+		match rx.await.context(ReceiveResponse)? {
+			Ok(response) => Ok(response),
+			Err(failure) => ServiceFailed { failure }.fail(),
+		}
 	}
 
 	/// Get the name list.
@@ -419,9 +445,9 @@ struct ConnectionHandler {
 	/// The write half.
 	write_half: AcseWriteHalf,
 	/// The receiver for the confirmed service requests.
-	rx: mpsc::Receiver<(ConfirmedServiceRequest, oneshot::Sender<ConfirmedServiceResponse>)>,
+	rx: mpsc::Receiver<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
 	/// The map of the response senders.
-	response_map: HashMap<u32, oneshot::Sender<ConfirmedServiceResponse>>,
+	response_map: HashMap<u32, oneshot::Sender<ServiceResult>>,
 	/// The report callback.
 	report_callback: Box<dyn ReportCallback + Send + Sync>,
 }
@@ -432,7 +458,7 @@ impl ConnectionHandler {
 	pub fn new(
 		read_half: AcseReadHalf,
 		write_half: AcseWriteHalf,
-		rx: mpsc::Receiver<(ConfirmedServiceRequest, oneshot::Sender<ConfirmedServiceResponse>)>,
+		rx: mpsc::Receiver<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
 		report_callback: Box<dyn ReportCallback + Send + Sync>,
 	) -> Self {
 		Self { read_half, write_half, rx, response_map: HashMap::new(), report_callback }
@@ -542,9 +568,8 @@ impl ConnectionHandler {
 			return;
 		};
 
-		let _ = sender.send(response).inspect_err(|e| {
+		let _ = sender.send(Ok(response)).inspect_err(|e| {
 			tracing::error!("Error sending response: {:?}", e);
-			// TODO: Handle error better
 		});
 	}
 
@@ -552,20 +577,35 @@ impl ConnectionHandler {
 	#[instrument(skip(self))]
 	async fn handle_confirmed_error(&mut self, response: ConfirmedErrorPDU) {
 		let invoke_id = response.invoke_id;
-		// Dropping the sender will close the channel.
-		// TODO: Forward back the error to the caller.
-		let _ = self.response_map.remove(&invoke_id.0);
+		let Some(sender) = self.response_map.remove(&invoke_id.0) else {
+			tracing::error!("No sender found for invoke ID: {} (confirmed-error)", invoke_id.0);
+			return;
+		};
+		let failure = ServiceFailure::ConfirmedError {
+			modifier_position: response.modifier_position.map(|m| m.0),
+			service_error: response.service_error,
+		};
+		let _ = sender.send(Err(failure)).inspect_err(|e| {
+			tracing::error!("Error forwarding confirmed-error to caller: {:?}", e);
+		});
 	}
 
 	/// Handle a rejected PDU.
 	#[instrument(skip(self))]
 	async fn handle_rejected_pdu(&mut self, response: RejectPDU) {
 		tracing::info!("Rejected PDU: {:?}", response);
-		if let Some(invoke_id) = response.original_invoke_id {
-			// Dropping the sender will close the channel.
-			// TODO: Forward back the error to the caller.
-			let _ = self.response_map.remove(&invoke_id.0);
-		}
+		let Some(invoke_id) = response.original_invoke_id else {
+			tracing::warn!("Reject PDU without original_invoke_id; cannot route");
+			return;
+		};
+		let Some(sender) = self.response_map.remove(&invoke_id.0) else {
+			tracing::error!("No sender found for invoke ID: {} (reject)", invoke_id.0);
+			return;
+		};
+		let failure = ServiceFailure::Rejected { reason: response.reject_reason };
+		let _ = sender.send(Err(failure)).inspect_err(|e| {
+			tracing::error!("Error forwarding reject to caller: {:?}", e);
+		});
 	}
 }
 
@@ -610,10 +650,14 @@ pub enum MmsClientError {
 	},
 	#[snafu(display("Error sending request"))]
 	SendRequest {
-		source: mpsc::error::SendError<(
-			ConfirmedServiceRequest,
-			oneshot::Sender<ConfirmedServiceResponse>,
-		)>,
+		source:
+			mpsc::error::SendError<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
+	#[snafu(display("Service failure: {:?}", failure))]
+	ServiceFailed {
+		failure: ServiceFailure,
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
@@ -697,6 +741,7 @@ impl MmsClientError {
 			MmsClientError::ReceiveResponse { context, .. } => context,
 			MmsClientError::DataAccessError { context, .. } => context,
 			MmsClientError::VisibleStringConversion { context, .. } => context,
+			MmsClientError::ServiceFailed { context, .. } => context,
 		}
 	}
 }

@@ -11,6 +11,41 @@ use crate::mms::{
 
 /// Maximum size for session selectors (S-SEL)
 const MAX_SESSION_SELECTOR_SIZE: usize = 16;
+/// Marker byte that introduces the extended length form per ISO 8327.
+const EXTENDED_LENGTH_MARKER: u8 = 0xFF;
+/// Inclusive upper bound for an LI/PI/PGI length encoded in the short form.
+const SHORT_LENGTH_MAX: usize = 254;
+
+/// Read an ISO 8327 length indicator (LI / PGI length / PI length).
+///
+/// Short form is a single byte in `0..=254`. The marker `0xFF` introduces
+/// the extended form, which is followed by a big-endian `u16` length.
+/// Returns `(length, bytes_consumed)`.
+fn read_li(bytes: &[u8], offset: usize) -> Result<(usize, usize), SessionError> {
+	let first = *bytes.get(offset).context(NotEnoughBytes)?;
+	if first == EXTENDED_LENGTH_MARKER {
+		let hi = *bytes.get(offset + 1).context(NotEnoughBytes)?;
+		let lo = *bytes.get(offset + 2).context(NotEnoughBytes)?;
+		Ok((u16::from_be_bytes([hi, lo]) as usize, 3))
+	} else {
+		Ok((first as usize, 1))
+	}
+}
+
+/// Append an ISO 8327 length indicator to `buf`, using the extended form
+/// when `length > 254`.
+fn push_li(buf: &mut Vec<u8>, length: usize) {
+	if length <= SHORT_LENGTH_MAX {
+		buf.push(length as u8);
+	} else {
+		// ISO 8327 caps the extended length at u16::MAX. Anything beyond
+		// that cannot be represented; the COTP layer rejects oversized
+		// frames upstream so this branch is unreachable in practice.
+		let length = u16::try_from(length).unwrap_or(u16::MAX);
+		buf.push(EXTENDED_LENGTH_MARKER);
+		buf.extend_from_slice(&length.to_be_bytes());
+	}
+}
 
 /// The ISO Session layer connection.
 #[derive(Debug)]
@@ -347,38 +382,41 @@ impl Spdu {
 	/// Parse SPDU from bytes
 	#[instrument(skip_all)]
 	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
-		let length = *bytes.get(1).context(NotEnoughBytes)? as usize;
+		let si = *bytes.first().context(NotEnoughBytes)?;
+		let (length, li_consumed) = read_li(bytes, 1)?;
+		let header_size = 1 + li_consumed;
+		let body = bytes.get(header_size..).context(NotEnoughBytes)?;
 
-		match (*bytes.first().context(NotEnoughBytes)?).into() {
+		match si.into() {
 			SpduType::Connect => {
-				if length != bytes.len() - 2 {
+				if body.len() != length {
 					return InvalidLength.fail();
 				}
-				ConnectSpdu::from_bytes(bytes).map(Self::Connect)
+				ConnectSpdu::from_body(body).map(Self::Connect)
 			}
 			SpduType::Accept => {
-				if length != bytes.len() - 2 {
+				if body.len() != length {
 					return InvalidLength.fail();
 				}
-				AcceptSpdu::from_bytes(bytes).map(Self::Accept)
+				AcceptSpdu::from_body(body).map(Self::Accept)
 			}
 			SpduType::GiveTokenData => DataSpdu::from_bytes(bytes).map(Self::Data),
 			SpduType::Finish => {
-				if length != bytes.len() - 2 {
+				if body.len() != length {
 					return InvalidLength.fail();
 				}
-				FinishSpdu::from_bytes(bytes).map(Self::Finish)
+				FinishSpdu::from_body(body).map(Self::Finish)
 			}
 			SpduType::Disconnect => {
-				if length != bytes.len() - 2 {
+				if body.len() != length {
 					return InvalidLength.fail();
 				}
-				DisconnectSpdu::from_bytes(bytes).map(Self::Disconnect)
+				DisconnectSpdu::from_body(body).map(Self::Disconnect)
 			}
-			SpduType::Abort => Ok(Self::Abort(AbortSpdu::from_bytes(bytes)?)),
-			SpduType::Refuse => Ok(Self::Refuse(RefuseSpdu::from_bytes(bytes)?)),
+			SpduType::Abort => Ok(Self::Abort(AbortSpdu::from_body(body)?)),
+			SpduType::Refuse => Ok(Self::Refuse(RefuseSpdu::from_body(body)?)),
 			SpduType::NotFinished => Ok(Self::NotFinished),
-			SpduType::Invalid => InvalidSpduType { value: bytes[0] }.fail(),
+			SpduType::Invalid => InvalidSpduType { value: si }.fail(),
 		}
 	}
 
@@ -432,11 +470,10 @@ impl ConnectSpdu {
 		}
 	}
 
-	/// Parse a Connect SPDU from bytes.
+	/// Parse a Connect SPDU body (the bytes after the SI + LI).
 	#[instrument(skip_all)]
-	pub fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
-		//skip SPDU identifier and length
-		let mut offset = 2;
+	pub fn from_body(bytes: &[u8]) -> Result<Self, SessionError> {
+		let mut offset = 0;
 
 		let mut called_session_selector = None;
 		let mut calling_session_selector = None;
@@ -446,13 +483,14 @@ impl ConnectSpdu {
 
 		while offset < bytes.len() {
 			let pgi = Pgi::from(*bytes.get(offset).context(UnexpectedEndOfMessage)?);
-			let param_len = bytes[offset + 1] as usize;
-			offset += 2;
+			let (param_len, li_consumed) = read_li(bytes, offset + 1)?;
+			offset += 1 + li_consumed;
+			let end = offset.checked_add(param_len).context(NotEnoughBytes)?;
 
 			match pgi {
 				Pgi::ConnectAcceptItem => {
 					protocol_options = Some(Self::parse_connect_accept_item(
-						bytes.get(offset..offset + param_len).context(NotEnoughBytes)?,
+						bytes.get(offset..end).context(NotEnoughBytes)?,
 					)?);
 				}
 				Pgi::SessionUserRequirements => {
@@ -467,18 +505,17 @@ impl ConnectSpdu {
 				}
 				Pgi::CallingSessionSelector => {
 					calling_session_selector = Some(SSelector::from_bytes(
-						bytes.get(offset..offset + param_len).context(NotEnoughBytes)?,
+						bytes.get(offset..end).context(NotEnoughBytes)?,
 					)?);
 				}
 				Pgi::CalledSessionSelector => {
 					called_session_selector = Some(SSelector::from_bytes(
-						bytes.get(offset..offset + param_len).context(NotEnoughBytes)?,
+						bytes.get(offset..end).context(NotEnoughBytes)?,
 					)?);
 				}
 				Pgi::UserData => {
-					user_data = Some(
-						bytes.get(offset..offset + param_len).context(NotEnoughBytes)?.to_vec(),
-					);
+					user_data =
+						Some(bytes.get(offset..end).context(NotEnoughBytes)?.to_vec());
 					break;
 				}
 				Pgi::Unknown49
@@ -491,7 +528,7 @@ impl ConnectSpdu {
 					tracing::debug!("Got PGI: 0x{:02x}. Ignoring it.", pgi as u8);
 				}
 			}
-			offset += param_len;
+			offset = end;
 		}
 
 		Ok(Self {
@@ -506,39 +543,21 @@ impl ConnectSpdu {
 	/// Encode a Connect SPDU to bytes.
 	#[must_use]
 	pub fn to_bytes(&self) -> Vec<u8> {
-		let mut buffer = Vec::new();
+		// Build the body first so we know its exact length and can encode the
+		// SPDU LI in the correct (short or extended) form.
+		let mut body = Vec::new();
+		Self::encode_connect_accept_item(&mut body, 0);
+		self.encode_session_requirement(&mut body);
+		self.encode_calling_session_selector(&mut body);
+		self.encode_called_session_selector(&mut body);
+		body.push(Pgi::UserData as u8);
+		push_li(&mut body, self.data.len());
+		body.extend_from_slice(&self.data);
 
-		// SPDU Identifier (SI)
+		let mut buffer = Vec::with_capacity(1 + 3 + body.len());
 		buffer.push(SpduType::Connect as u8);
-
-		//TODO: This is completely wrong. We need to calculate the length of the SPDU
-		// dynamically. Reserve space for Length Indicator (LI)
-		let length_offset = buffer.len();
-		buffer.push(0);
-
-		// Connection/Accept Item (PGI=5)
-		Self::encode_connect_accept_item(&mut buffer, 0);
-
-		// Session User Requirements (PGI=20)
-		self.encode_session_requirement(&mut buffer);
-
-		// Calling Session Selector (PGI=51)
-		self.encode_calling_session_selector(&mut buffer);
-
-		// Called Session Selector (PGI=52)
-		self.encode_called_session_selector(&mut buffer);
-
-		// User Data (PGI=193)
-		buffer.push(Pgi::UserData as u8);
-		buffer.push(self.data.len() as u8);
-
-		// Calculate and set length
-		let spdu_length = (buffer.len() - length_offset - 1) + self.data.len();
-		buffer[length_offset] = spdu_length as u8;
-
-		// Append payload
-		buffer.extend_from_slice(&self.data);
-
+		push_li(&mut buffer, body.len());
+		buffer.extend_from_slice(&body);
 		buffer
 	}
 
@@ -552,30 +571,24 @@ impl ConnectSpdu {
 		let mut protocol_options = 0;
 
 		while offset < bytes.len() {
-			if offset + 1 >= bytes.len() {
-				return UnexpectedEndOfMessage.fail();
-			}
-
-			let pi = Pi::from(bytes[offset]);
-			offset += 1;
-			let param_len = bytes[offset] as usize;
-			offset += 1;
+			let pi = Pi::from(*bytes.get(offset).context(UnexpectedEndOfMessage)?);
+			let (param_len, li_consumed) = read_li(bytes, offset + 1)?;
+			offset += 1 + li_consumed;
+			let end = offset.checked_add(param_len).context(NotEnoughBytes)?;
 
 			match pi {
 				Pi::ProtocolOptions => {
 					if param_len != 1 {
 						return InvalidParameterLength.fail();
 					}
-					protocol_options = bytes[offset];
-					offset += 1;
+					protocol_options = *bytes.get(offset).context(NotEnoughBytes)?;
 					has_protocol_options = true;
 				}
 				Pi::VersionNumber => {
 					if param_len != 1 {
 						return InvalidParameterLength.fail();
 					}
-					let version = bytes[offset];
-					offset += 1;
+					let version = *bytes.get(offset).context(NotEnoughBytes)?;
 					if version != 2 {
 						return InvalidVersion { value: version }.fail();
 					}
@@ -590,12 +603,12 @@ impl ConnectSpdu {
 				| Pi::LargeInitialSerialNumber
 				| Pi::LargeSecondInitialSerialNumber => {
 					tracing::debug!("Got PI: 0x{:02x}. Ignoring it.", pi as u8);
-					offset += param_len;
 				}
 				Pi::Invalid => {
 					return InvalidParameter { value: pi as u8 }.fail();
 				}
 			}
+			offset = end;
 		}
 
 		if has_protocol_options && has_protocol_version {
@@ -677,10 +690,10 @@ impl AcceptSpdu {
 		}
 	}
 
-	/// Parse an Accept SPDU from bytes.
+	/// Parse an Accept SPDU body (the bytes after SI + LI).
 	#[instrument(skip_all)]
-	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
-		let connect_spdu = ConnectSpdu::from_bytes(bytes)?;
+	fn from_body(bytes: &[u8]) -> Result<Self, SessionError> {
+		let connect_spdu = ConnectSpdu::from_body(bytes)?;
 		Ok(Self {
 			called_session_selector: connect_spdu.called_session_selector,
 			session_requirement: connect_spdu.session_requirement,
@@ -692,42 +705,37 @@ impl AcceptSpdu {
 	/// Encode an Accept SPDU to bytes.
 	#[must_use]
 	fn to_bytes(&self) -> Vec<u8> {
-		let mut buffer = Vec::new();
-
-		buffer.push(SpduType::Accept as u8);
-		let length_offset = buffer.len();
-		buffer.push(0);
-
 		// Connection/Accept Item
-		buffer.push(Pgi::ConnectAcceptItem as u8);
-		buffer.push(6);
-		buffer.push(Pi::ProtocolOptions as u8);
-		buffer.push(1);
-		buffer.push(self.protocol_options);
-		buffer.push(Pi::VersionNumber as u8);
-		buffer.push(1);
-		buffer.push(2);
-
-		// Session User Requirements
-		buffer.push(Pgi::SessionUserRequirements as u8);
-		buffer.push(2);
-		buffer.extend_from_slice(&(self.session_requirement as u16).to_le_bytes());
+		let mut body = vec![
+			Pgi::ConnectAcceptItem as u8,
+			6,
+			Pi::ProtocolOptions as u8,
+			1,
+			self.protocol_options,
+			Pi::VersionNumber as u8,
+			1,
+			2,
+			// Session User Requirements
+			Pgi::SessionUserRequirements as u8,
+			2,
+		];
+		body.extend_from_slice(&(self.session_requirement as u16).to_le_bytes());
 
 		// Called Session Selector
 		if let Some(called_session_selector) = &self.called_session_selector {
-			buffer.push(Pgi::CalledSessionSelector as u8);
-			buffer.extend_from_slice(&called_session_selector.to_bytes());
+			body.push(Pgi::CalledSessionSelector as u8);
+			body.extend_from_slice(&called_session_selector.to_bytes());
 		}
 
 		// User Data
-		buffer.push(Pgi::UserData as u8);
-		buffer.push(self.data.len() as u8);
+		body.push(Pgi::UserData as u8);
+		push_li(&mut body, self.data.len());
+		body.extend_from_slice(&self.data);
 
-		let spdu_length = (buffer.len() - length_offset - 1) + self.data.len();
-		buffer[length_offset] = spdu_length as u8;
-
-		buffer.extend_from_slice(&self.data);
-
+		let mut buffer = Vec::with_capacity(1 + 3 + body.len());
+		buffer.push(SpduType::Accept as u8);
+		push_li(&mut buffer, body.len());
+		buffer.extend_from_slice(&body);
 		buffer
 	}
 }
@@ -791,24 +799,27 @@ impl FinishSpdu {
 		Self { data: user_data }
 	}
 
-	/// Parse a Finish SPDU from bytes.
+	/// Parse a Finish SPDU body (the bytes after SI + LI).
 	#[instrument(skip_all)]
-	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
+	fn from_body(bytes: &[u8]) -> Result<Self, SessionError> {
 		let mut spdu = Self { data: Vec::new() };
-		spdu.parse_parameters(&bytes[2..])?;
+		spdu.parse_parameters(bytes)?;
 		Ok(spdu)
 	}
 
 	/// Encode a Finish SPDU to bytes.
 	#[must_use]
 	fn to_bytes(&self) -> Vec<u8> {
-		let mut buffer = vec![
-			SpduType::Finish as u8,
-			(2 + self.data.len()) as u8,
-			Pgi::UserData as u8,
-			self.data.len() as u8,
-		];
-		buffer.extend_from_slice(&self.data);
+		// User-Data PI: identifier + LI + data
+		let mut body = Vec::with_capacity(1 + 3 + self.data.len());
+		body.push(Pgi::UserData as u8);
+		push_li(&mut body, self.data.len());
+		body.extend_from_slice(&self.data);
+
+		let mut buffer = Vec::with_capacity(1 + 3 + body.len());
+		buffer.push(SpduType::Finish as u8);
+		push_li(&mut buffer, body.len());
+		buffer.extend_from_slice(&body);
 		buffer
 	}
 
@@ -818,22 +829,18 @@ impl FinishSpdu {
 		let mut offset = 0;
 
 		while offset < bytes.len() {
-			if offset + 1 >= bytes.len() {
-				return UnexpectedEndOfMessage.fail();
-			}
-
-			let pgi = Pgi::from(bytes[offset]);
-			offset += 1;
-			let param_len = bytes[offset] as usize;
-			offset += 1;
+			let pgi = Pgi::from(*bytes.get(offset).context(UnexpectedEndOfMessage)?);
+			let (param_len, li_consumed) = read_li(bytes, offset + 1)?;
+			offset += 1 + li_consumed;
+			let end = offset.checked_add(param_len).context(NotEnoughBytes)?;
 
 			match pgi {
 				Pgi::UserData => {
-					self.data = bytes[offset..].to_vec();
+					self.data = bytes.get(offset..end).context(NotEnoughBytes)?.to_vec();
 					return Ok(());
 				}
 				_ => {
-					offset += param_len;
+					offset = end;
 				}
 			}
 		}
@@ -856,22 +863,24 @@ impl DisconnectSpdu {
 		Self { user_data }
 	}
 
-	/// Parse a Disconnect SPDU from bytes.
+	/// Parse a Disconnect SPDU body (the bytes after SI + LI).
 	#[instrument(skip_all)]
-	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
-		FinishSpdu::from_bytes(bytes).map(|f| Self { user_data: f.data })
+	fn from_body(bytes: &[u8]) -> Result<Self, SessionError> {
+		FinishSpdu::from_body(bytes).map(|f| Self { user_data: f.data })
 	}
 
 	/// Encode a Disconnect SPDU to bytes.
 	#[must_use]
 	fn to_bytes(&self) -> Vec<u8> {
-		let mut buffer = vec![
-			SpduType::Disconnect as u8,
-			(2 + self.user_data.len()) as u8,
-			Pgi::UserData as u8,
-			self.user_data.len() as u8,
-		];
-		buffer.extend_from_slice(&self.user_data);
+		let mut body = Vec::with_capacity(1 + 3 + self.user_data.len());
+		body.push(Pgi::UserData as u8);
+		push_li(&mut body, self.user_data.len());
+		body.extend_from_slice(&self.user_data);
+
+		let mut buffer = Vec::with_capacity(1 + 3 + body.len());
+		buffer.push(SpduType::Disconnect as u8);
+		push_li(&mut buffer, body.len());
+		buffer.extend_from_slice(&body);
 		buffer
 	}
 }
@@ -891,29 +900,47 @@ impl AbortSpdu {
 		Self { user_data }
 	}
 
-	/// Parse an Abort SPDU from bytes.
+	/// Parse an Abort SPDU body (the bytes after SI + LI).
 	#[instrument(skip_all)]
-	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
-		if bytes.len() < 7 {
-			return MessageTooShort.fail();
+	fn from_body(bytes: &[u8]) -> Result<Self, SessionError> {
+		// Body layout sent by the encoder: TransportDisconnect PGI (id + LI=1 + 1
+		// reason byte = 3 bytes) followed by UserData PI (id + LI + data).
+		// Skip the transport-disconnect parameters by parsing their LI.
+		let pgi_id = *bytes.first().context(NotEnoughBytes)?;
+		if pgi_id != Pgi::TransportDisconnect as u8 {
+			return InvalidParameter { value: pgi_id }.fail();
 		}
-		// Skip transport disconnect parameters and extract user data
-		Ok(Self { user_data: bytes[7..].to_vec() })
+		let (td_len, td_li_consumed) = read_li(bytes, 1)?;
+		let after_td = 1 + td_li_consumed + td_len;
+
+		// UserData PI.
+		let ud_id = *bytes.get(after_td).context(NotEnoughBytes)?;
+		if ud_id != Pgi::UserData as u8 {
+			return InvalidParameter { value: ud_id }.fail();
+		}
+		let (ud_len, ud_li_consumed) = read_li(bytes, after_td + 1)?;
+		let ud_start = after_td + 1 + ud_li_consumed;
+		let ud_end = ud_start.checked_add(ud_len).context(NotEnoughBytes)?;
+		Ok(Self { user_data: bytes.get(ud_start..ud_end).context(NotEnoughBytes)?.to_vec() })
 	}
 
 	/// Encode an Abort SPDU to bytes.
 	#[must_use]
 	fn to_bytes(&self) -> Vec<u8> {
-		let mut buffer = vec![
-			SpduType::Abort as u8,
-			(5 + self.user_data.len()) as u8,
-			Pgi::TransportDisconnect as u8,
-			1,
-			11, // transport-connection-released | user-abort | no-reason
-			Pgi::UserData as u8,
-			self.user_data.len() as u8,
-		];
-		buffer.extend_from_slice(&self.user_data);
+		let mut body = Vec::with_capacity(3 + 1 + 3 + self.user_data.len());
+		// TransportDisconnect PGI
+		body.push(Pgi::TransportDisconnect as u8);
+		body.push(1);
+		body.push(11); // transport-connection-released | user-abort | no-reason
+		// User Data PI
+		body.push(Pgi::UserData as u8);
+		push_li(&mut body, self.user_data.len());
+		body.extend_from_slice(&self.user_data);
+
+		let mut buffer = Vec::with_capacity(1 + 3 + body.len());
+		buffer.push(SpduType::Abort as u8);
+		push_li(&mut buffer, body.len());
+		buffer.extend_from_slice(&body);
 		buffer
 	}
 }
@@ -933,14 +960,35 @@ impl RefuseSpdu {
 		Self { reason_code }
 	}
 
-	/// Parse a Refuse SPDU from bytes.
+	/// Parse a Refuse SPDU body (the bytes after SI + LI).
 	#[instrument(skip_all)]
-	fn from_bytes(bytes: &[u8]) -> Result<Self, SessionError> {
-		if bytes.len() < 10 {
-			return MessageTooShort.fail();
+	fn from_body(bytes: &[u8]) -> Result<Self, SessionError> {
+		// Walk: ConnectionIdentifier PGI (containing TransportDisconnect PGI
+		// and ReasonCode PI) — extract the reason byte from the ReasonCode PI.
+		let pgi_id = *bytes.first().context(NotEnoughBytes)?;
+		if pgi_id != Pgi::ConnectionIdentifier as u8 {
+			return InvalidParameter { value: pgi_id }.fail();
 		}
-		// Extract reason code from connection identifier
-		Ok(Self { reason_code: bytes[9] })
+		let (conn_len, conn_li_consumed) = read_li(bytes, 1)?;
+		let conn_start = 1 + conn_li_consumed;
+		let conn_end = conn_start.checked_add(conn_len).context(NotEnoughBytes)?;
+		let conn = bytes.get(conn_start..conn_end).context(NotEnoughBytes)?;
+
+		// Inside the ConnectionIdentifier scan for ReasonCode PI.
+		let mut offset = 0;
+		while offset < conn.len() {
+			let id = *conn.get(offset).context(NotEnoughBytes)?;
+			let (param_len, li_consumed) = read_li(conn, offset + 1)?;
+			offset += 1 + li_consumed;
+			let end = offset.checked_add(param_len).context(NotEnoughBytes)?;
+			if id == Pi::ReasonCode as u8 && param_len >= 1 {
+				return Ok(Self {
+					reason_code: *conn.get(offset).context(NotEnoughBytes)?,
+				});
+			}
+			offset = end;
+		}
+		MissingRequiredParameters.fail()
 	}
 
 	/// Encode a Refuse SPDU to bytes.
@@ -1162,10 +1210,41 @@ mod tests {
 			ConnectSpdu::new(calling.clone(), called.clone(), requirement, user_data.clone());
 		let bytes = spdu.to_bytes();
 
-		let parsed = ConnectSpdu::from_bytes(&bytes).unwrap();
+		let Spdu::Connect(parsed) = Spdu::from_bytes(&bytes).unwrap() else {
+			panic!("expected Connect SPDU");
+		};
 		assert_eq!(parsed.calling_session_selector, Some(calling));
 		assert_eq!(parsed.called_session_selector, Some(called));
 		assert_eq!(parsed.session_requirement, requirement);
+		assert_eq!(parsed.data, user_data);
+	}
+
+	#[test]
+	fn test_connect_spdu_extended_length_roundtrip() {
+		// A user-data payload larger than 254 forces the extended LI form for
+		// both the inner User-Data PI and the outer SPDU LI.
+		let calling = SSelector::from_bytes(&[0, 1, 2, 3]).unwrap();
+		let called = SSelector::from_bytes(&[4, 5, 6, 7]).unwrap();
+		let user_data = vec![0xab_u8; 600];
+
+		let spdu = ConnectSpdu::new(
+			calling.clone(),
+			called.clone(),
+			SessionRequirement::Duplex,
+			user_data.clone(),
+		);
+		let bytes = spdu.to_bytes();
+
+		// Sanity-check that the outer SPDU LI is in the extended form
+		// (marker 0xFF followed by a 2-byte big-endian length).
+		assert_eq!(bytes[0], SpduType::Connect as u8);
+		assert_eq!(bytes[1], 0xFF, "outer LI should be extended");
+
+		let Spdu::Connect(parsed) = Spdu::from_bytes(&bytes).unwrap() else {
+			panic!("expected Connect SPDU");
+		};
+		assert_eq!(parsed.calling_session_selector, Some(calling));
+		assert_eq!(parsed.called_session_selector, Some(called));
 		assert_eq!(parsed.data, user_data);
 	}
 
@@ -1175,7 +1254,9 @@ mod tests {
 		let spdu = FinishSpdu::new(user_data.clone());
 		let bytes = spdu.to_bytes();
 
-		let parsed = FinishSpdu::from_bytes(&bytes).unwrap();
+		let Spdu::Finish(parsed) = Spdu::from_bytes(&bytes).unwrap() else {
+			panic!("expected Finish SPDU");
+		};
 		assert_eq!(parsed.data, user_data);
 	}
 
@@ -1185,8 +1266,19 @@ mod tests {
 		let spdu = AbortSpdu::new(user_data.clone());
 		let bytes = spdu.to_bytes();
 
-		let parsed = AbortSpdu::from_bytes(&bytes).unwrap();
+		let Spdu::Abort(parsed) = Spdu::from_bytes(&bytes).unwrap() else {
+			panic!("expected Abort SPDU");
+		};
 		assert_eq!(parsed.user_data, user_data);
+	}
+
+	#[test]
+	fn test_connect_spdu_truncated_does_not_panic() {
+		// Crafted SPDU header claiming a body length much bigger than the
+		// actual byte slice. Before the bounds-check tightening, the inner
+		// loop could index past `bytes.len()`.
+		let truncated: Vec<u8> = vec![SpduType::Connect as u8, 0x80, 0x05, 0x06];
+		assert!(Spdu::from_bytes(&truncated).is_err());
 	}
 
 	#[test]
