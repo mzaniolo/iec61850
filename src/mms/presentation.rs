@@ -94,33 +94,40 @@ impl Presentation {
 		let cp_bytes = ber::encode(&cp).context(EncodeCp)?;
 		let response = self.session.connect(&cp_bytes).await?;
 		let cpa: CPAPPDU = ber::decode(&response).context(DecodeCpa)?;
-		//TODO: Check the CPA for errors
 
-		let user_data = cpa
-			.normal_mode_parameters
-			.context(MissingNormalModeParameters)?
-			.user_data
-			.context(MissingUserData)?;
-		let mut pdvs = match user_data {
+		let normal = cpa.normal_mode_parameters.context(MissingNormalModeParameters)?;
+
+		// If the peer returned a presentation-context-definition-result-list,
+		// verify that the contexts we proposed (ACSE + MMS) were accepted.
+		// A non-zero result means the context was rejected; surface it instead
+		// of pressing on and getting an opaque decoder failure later.
+		if let Some(result_list) = &normal.presentation_context_definition_result_list {
+			for entry in &result_list.0.0 {
+				let result_value: i64 = (&entry.result.0).try_into().unwrap_or(i64::MAX);
+				if result_value != 0 {
+					let provider_reason = entry
+						.provider_reason
+						.as_ref()
+						.and_then(|i| i64::try_from(i).ok());
+					return PresentationRefused {
+						result: result_value,
+						provider_reason,
+					}
+					.fail();
+				}
+			}
+		}
+
+		let user_data = normal.user_data.context(MissingUserData)?;
+		let pdvs = match user_data {
 			UserData::fully_encoded_data(data) => data.0,
 			UserData::simply_encoded_data(_) => {
 				return UnsupportedUserData.fail();
 			}
 		};
-		//TODO: Do I need to look at all the PDVs?
-		let pdv = pdvs.pop().context(MissingPdv)?;
-		let context_id = pdv
-			.presentation_context_identifier
-			.0
-			.try_into()
-			.map_err(|_| InvalidContextId.build())?;
-		let user_data = pdv.presentation_data_values;
-		match user_data {
-			PDVListPresentationDataValues::single_ASN1_type(data) => {
-				Ok((data.into_bytes(), context_id))
-			}
-			_ => UnsupportedPresentationDataValues.fail(),
-		}
+		// The CPA carries the AARE under the ACSE context. Match on context
+		// id rather than blindly popping the last PDV.
+		extract_pdv_by_context(pdvs, ACSE_CONTEXT_ID)
 	}
 
 	/// Split the presentation layer connection into a read half and a write
@@ -243,31 +250,48 @@ impl PresentationReadHalf {
 	) -> std::result::Result<(Vec<u8>, u64), PresentationError> {
 		let data = session_connection.receive_data().await?;
 		let data: UserData = ber::decode(&data).context(DecodeData)?;
-		let mut pdvs = match data {
+		let pdvs = match data {
 			UserData::fully_encoded_data(data) => data.0,
 			UserData::simply_encoded_data(_) => {
 				return UnsupportedUserData.fail();
 			}
 		};
-		//TODO: Do I need to look at all the PDVs?
-		let pdv = pdvs.pop().context(MissingPdv)?;
-		if pdv.transfer_syntax_name.is_some_and(|tsn| tsn.0 != *BER_OID_OBJECT_IDENTIFIER) {
-			return UnsupportedTransferSyntax.fail();
-		}
+		// Pick the PDV matching the MMS context instead of blindly popping
+		// the last one — peers may legitimately include other PDVs (e.g.
+		// during release exchanges) and silently treating them as MMS data
+		// produces opaque decode errors upstream.
+		extract_pdv_by_context(pdvs, MMS_CONTEXT_ID)
+	}
+}
 
-		let context_id = pdv
-			.presentation_context_identifier
-			.0
-			.try_into()
-			.map_err(|_| InvalidContextId.build())?;
-
-		let user_data = pdv.presentation_data_values;
-		match user_data {
-			PDVListPresentationDataValues::single_ASN1_type(data) => {
-				Ok((data.into_bytes(), context_id))
-			}
-			_ => UnsupportedPresentationDataValues.fail(),
+/// Find the PDV with the requested `context_id` in `pdvs`, validating
+/// transfer-syntax (must be BER if specified) and returning its payload
+/// bytes alongside the matched context id.
+fn extract_pdv_by_context(
+	pdvs: Vec<PDVList>,
+	context_id: u64,
+) -> std::result::Result<(Vec<u8>, u64), PresentationError> {
+	let pdv = pdvs
+		.into_iter()
+		.find(|pdv| {
+			u64::try_from(&pdv.presentation_context_identifier.0)
+				.is_ok_and(|id| id == context_id)
+		})
+		.context(MissingPdv)?;
+	if pdv
+		.transfer_syntax_name
+		.as_ref()
+		.is_some_and(|tsn| tsn.0 != *BER_OID_OBJECT_IDENTIFIER)
+	{
+		return UnsupportedTransferSyntax.fail();
+	}
+	let matched_id = u64::try_from(&pdv.presentation_context_identifier.0)
+		.map_err(|_| InvalidContextId.build())?;
+	match pdv.presentation_data_values {
+		PDVListPresentationDataValues::single_ASN1_type(data) => {
+			Ok((data.into_bytes(), matched_id))
 		}
+		_ => UnsupportedPresentationDataValues.fail(),
 	}
 }
 
@@ -352,6 +376,15 @@ pub enum PresentationError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
+	#[snafu(display(
+		"Presentation context rejected by peer (result={result}, provider_reason={provider_reason:?})"
+	))]
+	PresentationRefused {
+		result: i64,
+		provider_reason: Option<i64>,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 }
 
 impl PresentationError {
@@ -373,6 +406,7 @@ impl PresentationError {
 			PresentationError::CreateObjectIdentifier { context } => context,
 			PresentationError::EncodeCp { context, .. } => context,
 			PresentationError::DecodeCpa { context, .. } => context,
+			PresentationError::PresentationRefused { context, .. } => context,
 		}
 	}
 }

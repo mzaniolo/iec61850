@@ -26,6 +26,14 @@ pub(super) const COTP_MAX_TPDU_SIZE: u32 = 8192;
 pub(super) const COTP_DT_HEADER_SIZE: usize = 3;
 /// The size of the TPKT header.
 pub(super) const TPKT_HEADER_SIZE: usize = 4;
+/// Hard upper bound on the aggregate payload reassembled from a chain of
+/// `NoEot` DT TPDUs. A misbehaving peer could otherwise stream segments
+/// indefinitely and exhaust memory. Sized comfortably above any realistic
+/// MMS PDU (the MMS layer separately negotiates its own per-PDU limit).
+pub(super) const COTP_MAX_REASSEMBLED_SIZE: usize = 16 * 1024 * 1024;
+/// Maximum value an `LI` byte can carry in CR/CC TPDUs (it must fit in `u8`,
+/// and the value 0xFF is reserved).
+const COTP_MAX_LI: usize = 254;
 
 /// The COTP connection.
 #[derive(Debug)]
@@ -59,7 +67,7 @@ impl CotpConnection {
 
 		let local_ref = 1;
 
-		let tpkt = Tpkt::from_cotp(Cotp::Cr(CrTpdu::new(0, local_ref, options)));
+		let tpkt = Tpkt::from_cotp(Cotp::Cr(CrTpdu::new(0, local_ref, options)?));
 		connection
 			.write_all(&tpkt.to_bytes())
 			.await
@@ -135,29 +143,36 @@ impl ReadHalfConnection for CotpReadHalf {
 
 	#[instrument(skip(self))]
 	async fn receive_data(&mut self) -> Result<Vec<u8>, Self::Error> {
-		let mut data = Vec::new();
-		loop {
-			match Self::read_tpkt(&mut self.connection).await {
-				Ok(tpkt) => match tpkt.cotp {
-					Cotp::Dt(dt) => {
-						data.extend_from_slice(&dt.data);
-						if dt.eot == Eot::Eot {
-							break;
-						}
-					}
-					_ => return WrongCotpType.fail(),
-				},
-				Err(e) => {
-					tracing::error!("Error reading TPKT: {:?}", e);
-					return Err(e);
-				}
-			}
-		}
-		Ok(data)
+		Self::receive_data_from(&mut self.connection).await
 	}
 }
 
 impl CotpReadHalf {
+	/// Read DT TPDUs from `connection` until EOT, returning the reassembled
+	/// payload. Caps the aggregate at [`COTP_MAX_REASSEMBLED_SIZE`] so a
+	/// misbehaving peer can't exhaust memory by streaming `NoEot` fragments.
+	#[instrument(skip(connection))]
+	async fn receive_data_from<R: AsyncRead + Unpin>(
+		connection: &mut R,
+	) -> Result<Vec<u8>, CotpError> {
+		let mut data = Vec::new();
+		loop {
+			let tpkt = Self::read_tpkt(connection).await.inspect_err(|e| {
+				tracing::error!("Error reading TPKT: {:?}", e);
+			})?;
+			let Cotp::Dt(dt) = tpkt.cotp else {
+				return WrongCotpType.fail();
+			};
+			if data.len().saturating_add(dt.data.len()) > COTP_MAX_REASSEMBLED_SIZE {
+				return ReassemblyTooLarge { limit: COTP_MAX_REASSEMBLED_SIZE }.fail();
+			}
+			data.extend_from_slice(&dt.data);
+			if dt.eot == Eot::Eot {
+				return Ok(data);
+			}
+		}
+	}
+
 	/// Read a TPKT from the connection.
 	#[instrument(skip(connection))]
 	async fn read_tpkt<R: AsyncRead + Unpin>(connection: &mut R) -> Result<Tpkt, CotpError> {
@@ -344,14 +359,12 @@ struct CrTpdu {
 
 impl CrTpdu {
 	/// Create a new CR TPDU.
-	#[must_use]
-	fn new(dst_ref: u16, src_ref: u16, options: Vec<CotpOptions>) -> Self {
-		Self {
-			li: (options.iter().map(CotpOptions::len).sum::<usize>() + 6) as u8,
-			dst_ref,
-			src_ref,
-			options,
+	fn new(dst_ref: u16, src_ref: u16, options: Vec<CotpOptions>) -> Result<Self, CotpError> {
+		let li = options.iter().map(CotpOptions::len).sum::<usize>() + 6;
+		if li > COTP_MAX_LI {
+			return CrCcTooLarge { li }.fail();
 		}
+		Ok(Self { li: li as u8, dst_ref, src_ref, options })
 	}
 
 	/// Convert a byte array to a CR TPDU.
@@ -415,15 +428,17 @@ struct CcTpdu {
 
 impl CcTpdu {
 	/// Create a new CC TPDU.
-	#[must_use]
 	#[allow(dead_code)]
-	fn new(dst_ref: u16, src_ref: u16, options: Vec<CotpOptions>) -> Self {
-		Self {
-			li: (options.iter().map(CotpOptions::len).sum::<usize>() + 6) as u8,
-			dst_ref,
-			src_ref,
-			options,
+	fn new(
+		dst_ref: u16,
+		src_ref: u16,
+		options: Vec<CotpOptions>,
+	) -> Result<Self, CotpError> {
+		let li = options.iter().map(CotpOptions::len).sum::<usize>() + 6;
+		if li > COTP_MAX_LI {
+			return CrCcTooLarge { li }.fail();
 		}
+		Ok(Self { li: li as u8, dst_ref, src_ref, options })
 	}
 
 	/// Convert a byte array to a CC TPDU.
@@ -455,7 +470,7 @@ impl CcTpdu {
 
 	/// Convert a CC TPDU to a byte array.
 	fn to_bytes(&self) -> Vec<u8> {
-		let mut bytes = Vec::with_capacity(self.li as usize + 6);
+		let mut bytes = Vec::with_capacity(self.li as usize + 1);
 		bytes.push(self.li);
 		bytes.push(TpduType::CC as u8);
 		bytes.extend_from_slice(&self.dst_ref.to_be_bytes());
@@ -834,6 +849,20 @@ pub enum CotpError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
+	#[snafu(display(
+		"Reassembled COTP payload exceeds {limit} bytes; aborting to avoid OOM"
+	))]
+	ReassemblyTooLarge {
+		limit: usize,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
+	#[snafu(display("CR/CC TPDU length indicator {li} does not fit in a u8"))]
+	CrCcTooLarge {
+		li: usize,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	#[snafu(whatever, display("{message}{context}\n{source:?}"))]
 	Whatever {
 		message: String,
@@ -864,6 +893,8 @@ impl CotpError {
 			CotpError::InvalidTpduType { context, .. } => context,
 			CotpError::SizedSlice { context, .. } => context,
 			CotpError::NotEnoughBytes { context } => context,
+			CotpError::ReassemblyTooLarge { context, .. } => context,
+			CotpError::CrCcTooLarge { context, .. } => context,
 			CotpError::Whatever { context, .. } => context,
 		}
 	}
@@ -1160,7 +1191,7 @@ mod tests {
 			CotpOptions::TSelDst(TselDst { value: TEST_T_SEL.to_vec() }),
 			CotpOptions::TSelSrc(TselSrc { value: TEST_T_SEL.to_vec() }),
 		];
-		let cr_tpdu = CrTpdu::new(0x1234, 0x5678, options);
+		let cr_tpdu = CrTpdu::new(0x1234, 0x5678, options).unwrap();
 		let bytes = cr_tpdu.to_bytes();
 
 		// Verify basic structure
@@ -1182,7 +1213,7 @@ mod tests {
 			CotpOptions::TpduSize(TpduSize { value: 13 }),
 			CotpOptions::TSelDst(TselDst { value: TEST_T_SEL.to_vec() }),
 		];
-		let cc_tpdu = CcTpdu::new(0x1234, 0x5678, options);
+		let cc_tpdu = CcTpdu::new(0x1234, 0x5678, options).unwrap();
 		let bytes = cc_tpdu.to_bytes();
 
 		// Verify basic structure
@@ -1201,7 +1232,7 @@ mod tests {
 	fn test_cotp_enum_encoding_decoding() {
 		// Test CR
 		let options = vec![CotpOptions::TpduSize(TpduSize { value: 13 })];
-		let cr_tpdu = CrTpdu::new(0x1234, 0x5678, options);
+		let cr_tpdu = CrTpdu::new(0x1234, 0x5678, options).unwrap();
 		let cotp = Cotp::Cr(cr_tpdu);
 		let bytes = cotp.to_bytes();
 
@@ -1215,7 +1246,7 @@ mod tests {
 		}
 
 		// Test CC
-		let cc_tpdu = CcTpdu::new(0x1234, 0x5678, vec![]);
+		let cc_tpdu = CcTpdu::new(0x1234, 0x5678, vec![]).unwrap();
 		let cotp = Cotp::Cc(cc_tpdu);
 		let bytes = cotp.to_bytes();
 
@@ -1338,7 +1369,7 @@ mod tests {
 
 	#[test]
 	fn test_cr_tpdu_no_options() {
-		let cr_tpdu = CrTpdu::new(0x1234, 0x5678, vec![]);
+		let cr_tpdu = CrTpdu::new(0x1234, 0x5678, vec![]).unwrap();
 		let bytes = cr_tpdu.to_bytes();
 
 		// Should have LI = 6 (no options)
@@ -1356,7 +1387,7 @@ mod tests {
 
 	#[test]
 	fn test_cc_tpdu_no_options() {
-		let cc_tpdu = CcTpdu::new(0x1234, 0x5678, vec![]);
+		let cc_tpdu = CcTpdu::new(0x1234, 0x5678, vec![]).unwrap();
 		let bytes = cc_tpdu.to_bytes();
 
 		// Should have LI = 6 (no options)
@@ -1379,9 +1410,53 @@ mod tests {
 		assert_eq!(cotp.len(), 8); // 3 (header) + 5 (data)
 
 		let options = vec![CotpOptions::TpduSize(TpduSize { value: 13 })];
-		let cr_tpdu = CrTpdu::new(0x1234, 0x5678, options);
+		let cr_tpdu = CrTpdu::new(0x1234, 0x5678, options).unwrap();
 		let cotp = Cotp::Cr(cr_tpdu);
 		assert_eq!(cotp.len(), 10); // 6 (header) + 3 (tpdu_size) + 1 (li includes options)
+	}
+
+	#[test]
+	fn test_cr_tpdu_li_overflow_rejected() {
+		// Three TSelDst options each carrying 250 bytes of value pushes the LI
+		// above 254 and must be rejected at construction time instead of
+		// silently truncating.
+		let big = vec![0_u8; 250];
+		let options = vec![
+			CotpOptions::TSelDst(TselDst { value: big.clone() }),
+			CotpOptions::TSelDst(TselDst { value: big.clone() }),
+			CotpOptions::TSelDst(TselDst { value: big }),
+		];
+		assert!(matches!(
+			CrTpdu::new(0, 1, options),
+			Err(CotpError::CrCcTooLarge { .. })
+		));
+	}
+
+	#[tokio::test]
+	async fn test_receive_data_caps_reassembled_payload() {
+		// Build a stream of NoEot DT TPDUs large enough that their cumulative
+		// payload would exceed COTP_MAX_REASSEMBLED_SIZE. The reader must
+		// stop with ReassemblyTooLarge rather than keep accumulating.
+		let payload_len = (COTP_MAX_TPDU_SIZE as usize) - COTP_DT_HEADER_SIZE;
+		let tpkt_len = (TPKT_HEADER_SIZE + COTP_DT_HEADER_SIZE + payload_len) as u16;
+		let header = [
+			TPKT_VERSION,
+			0,
+			(tpkt_len >> 8) as u8,
+			tpkt_len as u8,
+			0x02,            // LI
+			TpduType::DT as u8,
+			Eot::NoEot as u8,
+		];
+		let needed = (COTP_MAX_REASSEMBLED_SIZE / payload_len) + 2;
+		let mut buf = Vec::with_capacity(needed * (header.len() + payload_len));
+		for _ in 0..needed {
+			buf.extend_from_slice(&header);
+			buf.resize(buf.len() + payload_len, 0);
+		}
+		let mut cursor = &buf[..];
+		let result = CotpReadHalf::receive_data_from(&mut cursor).await;
+		assert!(matches!(result, Err(CotpError::ReassemblyTooLarge { .. })));
 	}
 
 	#[test]

@@ -81,9 +81,21 @@ impl Acse {
 			self.presentation.connect(ber::encode(&aarq).context(EncodeAarq)?).await?;
 		let aare: AAREApdu = ber::decode(&data).context(DecodeAare)?;
 
-		//Check if the AARE result is successful
+		// Surface both the AARE result and the responder's diagnostic so
+		// callers can tell *why* the association was refused. Result 0
+		// means accepted; any non-zero value indicates rejection.
 		if aare.result.0 != Integer::from(0) {
-			return AareResultNotSuccessful.fail();
+			let result = i64::try_from(&aare.result.0).unwrap_or(i64::MAX);
+			let (source, code) = match &aare.result_source_diagnostic {
+				AssociateSourceDiagnostic::service_user(reason) => {
+					("service-user", i64::try_from(reason).unwrap_or(i64::MAX))
+				}
+				AssociateSourceDiagnostic::service_provider(reason) => {
+					("service-provider", i64::try_from(reason).unwrap_or(i64::MAX))
+				}
+			};
+			return AareResultNotSuccessful { result, diagnostic_source: source, diagnostic_code: code }
+				.fail();
 		}
 
 		let user_data = aare
@@ -207,8 +219,13 @@ pub enum AcseError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
-	#[snafu(display("AARE result not successful"))]
+	#[snafu(display(
+		"AARE rejected (result={result}, {diagnostic_source}={diagnostic_code})"
+	))]
 	AareResultNotSuccessful {
+		result: i64,
+		diagnostic_source: &'static str,
+		diagnostic_code: i64,
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
@@ -234,7 +251,7 @@ impl AcseError {
 			AcseError::WrongUserInformationEncoding { context } => context,
 			AcseError::MissingUserInformation { context } => context,
 			AcseError::DecodeAare { context, .. } => context,
-			AcseError::AareResultNotSuccessful { context } => context,
+			AcseError::AareResultNotSuccessful { context, .. } => context,
 			AcseError::EncodeAarq { context, .. } => context,
 			AcseError::CreateObjectIdentifier { context } => context,
 		}

@@ -1,12 +1,12 @@
 //! MMS client implementation.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use rasn::{ber, prelude::*};
 use snafu::{ResultExt as _, Snafu};
 use tokio::{
 	select,
-	sync::{mpsc, oneshot},
+	sync::{Semaphore, mpsc, oneshot},
 };
 use tracing::instrument;
 
@@ -45,6 +45,20 @@ pub enum ServiceFailure {
 		/// Reject reason from the Reject PDU.
 		reason: RejectPDURejectReason,
 	},
+	/// The connection to the peer was closed (gracefully or by I/O error)
+	/// while this request was outstanding.
+	ConnectionClosed {
+		/// Human-readable reason captured from the connection-handler loop.
+		reason: String,
+	},
+	/// The BER-encoded request exceeds the MMS PDU size negotiated with
+	/// the peer. The caller must split the request and retry.
+	PduTooLarge {
+		/// Size of the encoded PDU that was about to be sent.
+		encoded: usize,
+		/// Negotiated maximum PDU size from `Initiate-ResponsePDU`.
+		limit: usize,
+	},
 }
 /// The service support options.
 const SERVICE_SUPPORT_OPTIONS: [u8; 11] =
@@ -55,13 +69,18 @@ const PARAMETER_SUPPORT_OPTIONS: [u8; 2] = [0xf1, 0x00];
 /// The MMS client.
 #[derive(Debug)]
 pub struct MmsClient {
-	// TODO: Do we need to store these values?
-	// max_serv_outstanding_calling: i16,
-	// max_serv_outstanding_called: i16,
-	// data_structure_nesting_level: i8,
-	// max_pdu_size: i32,
-	/// The sender for the confirmed service requests.
+	/// Sender used to hand confirmed service requests to the connection
+	/// handler task.
 	tx: mpsc::Sender<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
+	/// Per-request timeout, copied from `ClientConfig` at connect time.
+	request_timeout: Option<Duration>,
+	/// MMS PDU size negotiated with the peer; we refuse to send PDUs larger
+	/// than this so the peer doesn't have to do the rejection for us.
+	negotiated_max_pdu_size: usize,
+	/// Limits the number of in-flight requests to the value negotiated with
+	/// the peer (`negotiated_max_serv_outstanding_calling`). Acts as
+	/// back-pressure on `send_request`.
+	outstanding: Arc<Semaphore>,
 }
 
 impl MmsClient {
@@ -120,40 +139,73 @@ impl MmsClient {
 		// TODO: Check if the services supported by the server are supported by the
 		// client
 
-		// max_serv_outstanding_called =
-		// response.negotiated_max_serv_outstanding_called.0;
-		// max_serv_outstanding_calling =
-		// response.negotiated_max_serv_outstanding_calling.0; if let Some(level) =
-		// response.negotiated_data_structure_nesting_level {
-		// 	data_structure_nesting_level = level.0;
-		// }
-		// if let Some(size) = response.local_detail_called {
-		// 	max_pdu_size = size.0;
-		// }
+		// Honor what the peer negotiated. The peer may have asked for a
+		// smaller PDU or fewer outstanding services than we proposed.
+		let negotiated_max_pdu_size: usize = response
+			.local_detail_called
+			.as_ref()
+			.map_or(max_pdu_size, |size| size.0)
+			.try_into()
+			.unwrap_or(0);
+		let negotiated_max_outstanding =
+			response.negotiated_max_serv_outstanding_calling.0.max(1) as usize;
 
 		let (read_half, write_half) = acse.split();
 		let (tx, rx) = mpsc::channel(100);
-		let handler = ConnectionHandler::new(read_half, write_half, rx, report_callback);
+		let outstanding = Arc::new(Semaphore::new(negotiated_max_outstanding));
+		let handler = ConnectionHandler::new(
+			read_half,
+			write_half,
+			rx,
+			report_callback,
+			negotiated_max_pdu_size,
+		);
 		tokio::spawn(handler.handle_connection());
 
 		Ok(Self {
 			tx,
-			// max_serv_outstanding_calling,
-			// max_serv_outstanding_called,
-			// data_structure_nesting_level,
-			// max_pdu_size,
+			request_timeout: config.connection.request_timeout,
+			negotiated_max_pdu_size,
+			outstanding,
 		})
 	}
 
+	/// Return the MMS PDU size negotiated with the peer. Callers building
+	/// large requests can use this to chunk their payloads (e.g. read/write
+	/// of long variable lists) before invoking `send_request`.
+	#[must_use]
+	pub const fn max_pdu_size(&self) -> usize {
+		self.negotiated_max_pdu_size
+	}
+
 	/// Send a confirmed service request.
+	///
+	/// Enforces three things in order:
+	/// 1. Back-pressure: no more concurrent requests than the peer
+	///    negotiated (`max_serv_outstanding_calling`).
+	/// 2. Per-request timeout (configurable via
+	///    `ClientConfig::connection::request_timeout`).
+	/// 3. The encoded PDU size check is done inside the connection handler
+	///    once the invoke-id is known; this method does not encode.
 	#[instrument(skip(self))]
 	async fn send_request(
 		&self,
 		request: ConfirmedServiceRequest,
 	) -> Result<ConfirmedServiceResponse, MmsClientError> {
+		let permit =
+			self.outstanding.clone().acquire_owned().await.map_err(|_| ConnectionGone.build())?;
 		let (tx, rx) = oneshot::channel();
-		self.tx.send((request, tx)).await.context(SendRequest)?;
-		match rx.await.context(ReceiveResponse)? {
+		self.tx.send((request, tx)).await.map_err(|_| ConnectionGone.build())?;
+
+		let result = match self.request_timeout {
+			Some(timeout) => tokio::time::timeout(timeout, rx)
+				.await
+				.map_err(|_| RequestTimeout { timeout }.build())?,
+			None => rx.await,
+		};
+		drop(permit);
+
+		match result.context(ReceiveResponse)? {
 			Ok(response) => Ok(response),
 			Err(failure) => ServiceFailed { failure }.fail(),
 		}
@@ -450,6 +502,10 @@ struct ConnectionHandler {
 	response_map: HashMap<u32, oneshot::Sender<ServiceResult>>,
 	/// The report callback.
 	report_callback: Box<dyn ReportCallback + Send + Sync>,
+	/// MMS PDU size negotiated with the peer; encoded requests larger than
+	/// this are rejected to the caller with `ServiceFailure::PduTooLarge`
+	/// instead of being sent. Zero means "no limit known".
+	max_pdu_size: usize,
 }
 
 impl ConnectionHandler {
@@ -460,102 +516,161 @@ impl ConnectionHandler {
 		write_half: AcseWriteHalf,
 		rx: mpsc::Receiver<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
 		report_callback: Box<dyn ReportCallback + Send + Sync>,
+		max_pdu_size: usize,
 	) -> Self {
-		Self { read_half, write_half, rx, response_map: HashMap::new(), report_callback }
+		Self {
+			read_half,
+			write_half,
+			rx,
+			response_map: HashMap::new(),
+			report_callback,
+			max_pdu_size,
+		}
 	}
 
 	/// Handle the MMS connection.
 	/// This is the main loop for the MMS connection.
 	#[instrument(skip(self))]
 	async fn handle_connection(mut self) {
-		let mut invoke_id = 0;
-		loop {
+		let mut invoke_id: u32 = 0;
+		let close_reason = loop {
 			select! {
 				data = self.read_half.receive_data() => {
-					let data = match data {
-						Ok(data) => data,
-						Err(e) => {
-							tracing::error!("Error receiving data: {:?}", e);
-							// TODO: Handle error better
-							break;
-						}
-					};
-
-					let response: MMSpdu = match ber::decode(&data).context(DecodeResponse) {
-						Ok(response) => response,
-						Err(e) => {
-							tracing::error!("Error decoding response: {:?}", e);
-							// TODO: Handle error better
-							continue;
-						}
-					};
-					match response {
-						MMSpdu::confirmed_ResponsePDU(response) => {
-							self.handle_confirmed_response(response).await;
-						},
-						MMSpdu::confirmed_ErrorPDU(response) => {
-							self.handle_confirmed_error(response).await;
-						}
-						MMSpdu::unconfirmed_PDU(response) => {
-							match response.service {
-								UnconfirmedService::informationReport(report) => {
-									let report = match Report::try_from(report){
-										Ok(report) => report,
-										Err(e) => {
-											tracing::error!("Error decoding report: {:?}", e);
-											continue;
-										}
-									};
-									// TODO: Should we spawn a task here?
-									self.report_callback.on_report(report).await;
-								}
-							}
-						}
-						MMSpdu::rejectPDU(response) => {
-							self.handle_rejected_pdu(response).await;
-						}
-						MMSpdu::initiate_ResponsePDU(response) => {
-							tracing::info!("Initiate Response PDU: {:?}", response);
-						}
-						MMSpdu::initiate_ErrorPDU(response) => {
-							tracing::info!("Initiate Error PDU: {:?}", response);
-						}
-						MMSpdu::conclude_RequestPDU(response) => {
-							tracing::info!("Conclude Request PDU: {:?}", response);
-						}
-						_ => {
-							tracing::error!("Unexpected service response. Response: {:?}", response);
-							continue;
-						}
+					match self.handle_incoming(data).await {
+						LoopAction::Continue => {}
+						LoopAction::Break(reason) => break reason,
 					}
 				},
 				request = self.rx.recv() => {
-					match request {
-						Some((request, sender)) => {
-							let data = match prepare_request(invoke_id, request) {
-								Ok(data) => data,
-								Err(e) => {
-									tracing::error!("Error preparing request: {:?}", e);
-									// TODO: Handle error better
-									continue;
-								}
-							};
-							if let Err(e) = self.write_half.send_data(data).await {
-								tracing::error!("Error sending data: {:?}", e);
-								// TODO: Handle error better
-								continue;
-							}
-							self.response_map.insert(invoke_id, sender);
-							invoke_id += 1;
-						}
-						None => {
-							tracing::info!("No more requests to send");
-							break;
-						}
+					match self.handle_outgoing(request, &mut invoke_id).await {
+						LoopAction::Continue => {}
+						LoopAction::Break(reason) => break reason,
 					}
 				},
 			}
+		};
+
+		// Drain any waiters so callers get a typed error instead of an
+		// opaque oneshot RecvError.
+		for (_, sender) in self.response_map.drain() {
+			let _ = sender.send(Err(ServiceFailure::ConnectionClosed {
+				reason: close_reason.clone(),
+			}));
 		}
+		// Close the request channel so subsequent send_request calls fail
+		// fast rather than hang on the now-orphaned receiver.
+		self.rx.close();
+	}
+
+	/// Handle one frame received from the peer. Returns whether the main
+	/// loop should keep going or exit (with a reason for the waiters).
+	async fn handle_incoming(
+		&mut self,
+		data: Result<Vec<u8>, AcseError>,
+	) -> LoopAction {
+		let data = match data {
+			Ok(data) => data,
+			Err(e) => {
+				let reason = format!("receive failed: {e}");
+				tracing::error!("{}", reason);
+				return LoopAction::Break(reason);
+			}
+		};
+		let response: MMSpdu = match ber::decode(&data).context(DecodeResponse) {
+			Ok(response) => response,
+			Err(e) => {
+				tracing::error!("Error decoding response: {:?}", e);
+				return LoopAction::Continue;
+			}
+		};
+		match response {
+			MMSpdu::confirmed_ResponsePDU(response) => {
+				self.handle_confirmed_response(response).await;
+			}
+			MMSpdu::confirmed_ErrorPDU(response) => {
+				self.handle_confirmed_error(response).await;
+			}
+			MMSpdu::unconfirmed_PDU(response) => match response.service {
+				UnconfirmedService::informationReport(report) => {
+					match Report::try_from(report) {
+						Ok(report) => self.report_callback.on_report(report).await,
+						Err(e) => tracing::error!("Error decoding report: {:?}", e),
+					}
+				}
+			},
+			MMSpdu::rejectPDU(response) => {
+				self.handle_rejected_pdu(response).await;
+			}
+			MMSpdu::initiate_ResponsePDU(response) => {
+				tracing::warn!(
+					"Unexpected initiate-Response after connect: {:?}",
+					response
+				);
+			}
+			MMSpdu::initiate_ErrorPDU(response) => {
+				// Fatal: the peer told us the association is broken.
+				let reason = format!("initiate-Error from peer: {:?}", response);
+				tracing::error!("{}", reason);
+				return LoopAction::Break(reason);
+			}
+			MMSpdu::conclude_RequestPDU(_) => {
+				// The ASN.1 module doesn't expose conclude-ResponsePDU yet,
+				// so we can't reply politely. Stop the loop so waiters learn
+				// the connection is closing.
+				let reason = "peer sent conclude-Request".to_owned();
+				tracing::info!("{}", reason);
+				return LoopAction::Break(reason);
+			}
+			_ => {
+				tracing::error!("Unexpected service response. Response: {:?}", response);
+			}
+		}
+		LoopAction::Continue
+	}
+
+	/// Handle one outgoing request from the rx channel.
+	async fn handle_outgoing(
+		&mut self,
+		request: Option<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
+		invoke_id: &mut u32,
+	) -> LoopAction {
+		let Some((request, sender)) = request else {
+			return LoopAction::Break("client dropped".to_owned());
+		};
+		let id = self.next_free_invoke_id(invoke_id);
+		let data = match prepare_request(id, request) {
+			Ok(data) => data,
+			Err(e) => {
+				tracing::error!("Error preparing request: {:?}", e);
+				let _ = sender.send(Err(ServiceFailure::ConnectionClosed {
+					reason: format!("encode failed: {e}"),
+				}));
+				return LoopAction::Continue;
+			}
+		};
+		if self.max_pdu_size > 0 && data.len() > self.max_pdu_size {
+			let _ = sender.send(Err(ServiceFailure::PduTooLarge {
+				encoded: data.len(),
+				limit: self.max_pdu_size,
+			}));
+			return LoopAction::Continue;
+		}
+		if let Err(e) = self.write_half.send_data(data).await {
+			let reason = format!("send failed: {e}");
+			tracing::error!("{}", reason);
+			let _ = sender.send(Err(ServiceFailure::ConnectionClosed {
+				reason: reason.clone(),
+			}));
+			return LoopAction::Break(reason);
+		}
+		self.response_map.insert(id, sender);
+		LoopAction::Continue
+	}
+
+	/// Delegate to the free function; kept as a method only so the caller
+	/// site stays terse inside the select loop.
+	fn next_free_invoke_id(&self, counter: &mut u32) -> u32 {
+		next_free_invoke_id(counter, &self.response_map)
 	}
 
 	/// Handle a confirmed response.
@@ -609,6 +724,33 @@ impl ConnectionHandler {
 	}
 }
 
+/// What the connection-handler loop should do after handling one event.
+enum LoopAction {
+	/// Keep looping.
+	Continue,
+	/// Stop looping with the given human-readable reason; the reason is
+	/// forwarded to every pending waiter so callers can tell why their
+	/// request was abandoned.
+	Break(String),
+}
+
+/// Pick the next unused invoke-id, wrapping on u32 overflow. The
+/// outstanding-requests semaphore already caps concurrent in-flight
+/// requests, so collisions are not expected; the linear scan is just a
+/// belt-and-suspenders guard against ever overwriting a live waiter.
+fn next_free_invoke_id(
+	counter: &mut u32,
+	in_flight: &HashMap<u32, oneshot::Sender<ServiceResult>>,
+) -> u32 {
+	loop {
+		let id = *counter;
+		*counter = counter.wrapping_add(1);
+		if !in_flight.contains_key(&id) {
+			return id;
+		}
+	}
+}
+
 /// Prepare a request for sending.
 /// This function will prepare the request for sending by encoding it and adding
 /// the invoke ID.
@@ -648,16 +790,20 @@ pub enum MmsClientError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
-	#[snafu(display("Error sending request"))]
-	SendRequest {
-		source:
-			mpsc::error::SendError<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
-		#[snafu(implicit)]
-		context: Box<SpanTraceWrapper>,
-	},
 	#[snafu(display("Service failure: {:?}", failure))]
 	ServiceFailed {
 		failure: ServiceFailure,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
+	#[snafu(display("Request timed out after {timeout:?}"))]
+	RequestTimeout {
+		timeout: Duration,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
+	#[snafu(display("MMS connection handler is no longer accepting requests"))]
+	ConnectionGone {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
@@ -737,11 +883,12 @@ impl MmsClientError {
 			MmsClientError::VersionMismatch { context } => context,
 			MmsClientError::DecodeResponse { context, .. } => context,
 			MmsClientError::EncodeRequest { context, .. } => context,
-			MmsClientError::SendRequest { context, .. } => context,
 			MmsClientError::ReceiveResponse { context, .. } => context,
 			MmsClientError::DataAccessError { context, .. } => context,
 			MmsClientError::VisibleStringConversion { context, .. } => context,
 			MmsClientError::ServiceFailed { context, .. } => context,
+			MmsClientError::RequestTimeout { context, .. } => context,
+			MmsClientError::ConnectionGone { context } => context,
 		}
 	}
 }
@@ -846,6 +993,30 @@ mod tests {
 		} else {
 			panic!("Expected confirmed_ResponsePDU");
 		}
+	}
+
+	#[test]
+	fn test_next_free_invoke_id_skips_in_flight() {
+		// If id 5 is already in flight, the counter should skip it on its
+		// next pass and hand back 6 instead.
+		let mut counter: u32 = 5;
+		let (tx, _rx) = oneshot::channel();
+		let mut in_flight: HashMap<u32, oneshot::Sender<ServiceResult>> = HashMap::new();
+		in_flight.insert(5, tx);
+		let id = next_free_invoke_id(&mut counter, &in_flight);
+		assert_eq!(id, 6);
+		// Counter advanced past the collision.
+		assert_eq!(counter, 7);
+	}
+
+	#[test]
+	fn test_next_free_invoke_id_wraps_around() {
+		// The counter must wrap cleanly at u32::MAX instead of overflowing.
+		let mut counter = u32::MAX;
+		let in_flight: HashMap<u32, oneshot::Sender<ServiceResult>> = HashMap::new();
+		let id = next_free_invoke_id(&mut counter, &in_flight);
+		assert_eq!(id, u32::MAX);
+		assert_eq!(counter, 0);
 	}
 
 	struct TestReportCallback;

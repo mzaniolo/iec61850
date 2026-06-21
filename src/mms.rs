@@ -1,6 +1,6 @@
 //! MMS implementation.
 
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use cotp::COTP_MAX_TPDU_SIZE;
@@ -69,6 +69,17 @@ pub struct ConnectionConfig {
 	pub data_structure_nesting_level: i8,
 	/// The maximum PDU size.
 	pub max_pdu_size: i32,
+	/// Maximum time to wait for a server response to a confirmed request
+	/// before failing with `RequestTimeout`. Set to `None` to wait forever.
+	#[serde(default = "default_request_timeout")]
+	pub request_timeout: Option<Duration>,
+}
+
+/// Default per-request timeout: 30 seconds. Picked to be long enough for the
+/// slowest reasonable IED while still bounding hangs caused by a peer that
+/// silently drops requests.
+const fn default_request_timeout() -> Option<Duration> {
+	Some(Duration::from_secs(30))
 }
 
 /// The client TLS configuration
@@ -126,6 +137,7 @@ impl Default for ConnectionConfig {
 			max_serv_outstanding_called: 10,
 			data_structure_nesting_level: 10,
 			max_pdu_size: 8192,
+			request_timeout: default_request_timeout(),
 		}
 	}
 }
