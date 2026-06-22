@@ -105,15 +105,9 @@ impl Presentation {
 			for entry in &result_list.0.0 {
 				let result_value: i64 = (&entry.result.0).try_into().unwrap_or(i64::MAX);
 				if result_value != 0 {
-					let provider_reason = entry
-						.provider_reason
-						.as_ref()
-						.and_then(|i| i64::try_from(i).ok());
-					return PresentationRefused {
-						result: result_value,
-						provider_reason,
-					}
-					.fail();
+					let provider_reason =
+						entry.provider_reason.as_ref().and_then(|i| i64::try_from(i).ok());
+					return PresentationRefused { result: result_value, provider_reason }.fail();
 				}
 			}
 		}
@@ -274,15 +268,10 @@ fn extract_pdv_by_context(
 	let pdv = pdvs
 		.into_iter()
 		.find(|pdv| {
-			u64::try_from(&pdv.presentation_context_identifier.0)
-				.is_ok_and(|id| id == context_id)
+			u64::try_from(&pdv.presentation_context_identifier.0).is_ok_and(|id| id == context_id)
 		})
 		.context(MissingPdv)?;
-	if pdv
-		.transfer_syntax_name
-		.as_ref()
-		.is_some_and(|tsn| tsn.0 != *BER_OID_OBJECT_IDENTIFIER)
-	{
+	if pdv.transfer_syntax_name.as_ref().is_some_and(|tsn| tsn.0 != *BER_OID_OBJECT_IDENTIFIER) {
 		return UnsupportedTransferSyntax.fail();
 	}
 	let matched_id = u64::try_from(&pdv.presentation_context_identifier.0)

@@ -181,12 +181,12 @@ impl MmsClient {
 	/// Send a confirmed service request.
 	///
 	/// Enforces three things in order:
-	/// 1. Back-pressure: no more concurrent requests than the peer
-	///    negotiated (`max_serv_outstanding_calling`).
+	/// 1. Back-pressure: no more concurrent requests than the peer negotiated
+	///    (`max_serv_outstanding_calling`).
 	/// 2. Per-request timeout (configurable via
 	///    `ClientConfig::connection::request_timeout`).
-	/// 3. The encoded PDU size check is done inside the connection handler
-	///    once the invoke-id is known; this method does not encode.
+	/// 3. The encoded PDU size check is done inside the connection handler once
+	///    the invoke-id is known; this method does not encode.
 	#[instrument(skip(self))]
 	async fn send_request(
 		&self,
@@ -553,9 +553,8 @@ impl ConnectionHandler {
 		// Drain any waiters so callers get a typed error instead of an
 		// opaque oneshot RecvError.
 		for (_, sender) in self.response_map.drain() {
-			let _ = sender.send(Err(ServiceFailure::ConnectionClosed {
-				reason: close_reason.clone(),
-			}));
+			let _ =
+				sender.send(Err(ServiceFailure::ConnectionClosed { reason: close_reason.clone() }));
 		}
 		// Close the request channel so subsequent send_request calls fail
 		// fast rather than hang on the now-orphaned receiver.
@@ -564,10 +563,7 @@ impl ConnectionHandler {
 
 	/// Handle one frame received from the peer. Returns whether the main
 	/// loop should keep going or exit (with a reason for the waiters).
-	async fn handle_incoming(
-		&mut self,
-		data: Result<Vec<u8>, AcseError>,
-	) -> LoopAction {
+	async fn handle_incoming(&mut self, data: Result<Vec<u8>, AcseError>) -> LoopAction {
 		let data = match data {
 			Ok(data) => data,
 			Err(e) => {
@@ -591,21 +587,16 @@ impl ConnectionHandler {
 				self.handle_confirmed_error(response).await;
 			}
 			MMSpdu::unconfirmed_PDU(response) => match response.service {
-				UnconfirmedService::informationReport(report) => {
-					match Report::try_from(report) {
-						Ok(report) => self.report_callback.on_report(report).await,
-						Err(e) => tracing::error!("Error decoding report: {:?}", e),
-					}
-				}
+				UnconfirmedService::informationReport(report) => match Report::try_from(report) {
+					Ok(report) => self.report_callback.on_report(report).await,
+					Err(e) => tracing::error!("Error decoding report: {:?}", e),
+				},
 			},
 			MMSpdu::rejectPDU(response) => {
 				self.handle_rejected_pdu(response).await;
 			}
 			MMSpdu::initiate_ResponsePDU(response) => {
-				tracing::warn!(
-					"Unexpected initiate-Response after connect: {:?}",
-					response
-				);
+				tracing::warn!("Unexpected initiate-Response after connect: {:?}", response);
 			}
 			MMSpdu::initiate_ErrorPDU(response) => {
 				// Fatal: the peer told us the association is broken.
@@ -658,9 +649,7 @@ impl ConnectionHandler {
 		if let Err(e) = self.write_half.send_data(data).await {
 			let reason = format!("send failed: {e}");
 			tracing::error!("{}", reason);
-			let _ = sender.send(Err(ServiceFailure::ConnectionClosed {
-				reason: reason.clone(),
-			}));
+			let _ = sender.send(Err(ServiceFailure::ConnectionClosed { reason: reason.clone() }));
 			return LoopAction::Break(reason);
 		}
 		self.response_map.insert(id, sender);

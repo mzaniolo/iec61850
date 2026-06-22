@@ -94,8 +94,12 @@ impl Acse {
 					("service-provider", i64::try_from(reason).unwrap_or(i64::MAX))
 				}
 			};
-			return AareResultNotSuccessful { result, diagnostic_source: source, diagnostic_code: code }
-				.fail();
+			return AareResultNotSuccessful {
+				result,
+				diagnostic_source: source,
+				diagnostic_code: code,
+			}
+			.fail();
 		}
 
 		let user_data = aare
@@ -219,9 +223,7 @@ pub enum AcseError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
-	#[snafu(display(
-		"AARE rejected (result={result}, {diagnostic_source}={diagnostic_code})"
-	))]
+	#[snafu(display("AARE rejected (result={result}, {diagnostic_source}={diagnostic_code})"))]
 	AareResultNotSuccessful {
 		result: i64,
 		diagnostic_source: &'static str,

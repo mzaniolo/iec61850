@@ -429,11 +429,7 @@ struct CcTpdu {
 impl CcTpdu {
 	/// Create a new CC TPDU.
 	#[allow(dead_code)]
-	fn new(
-		dst_ref: u16,
-		src_ref: u16,
-		options: Vec<CotpOptions>,
-	) -> Result<Self, CotpError> {
+	fn new(dst_ref: u16, src_ref: u16, options: Vec<CotpOptions>) -> Result<Self, CotpError> {
 		let li = options.iter().map(CotpOptions::len).sum::<usize>() + 6;
 		if li > COTP_MAX_LI {
 			return CrCcTooLarge { li }.fail();
@@ -574,7 +570,11 @@ fn bytes_to_options(bytes: &[u8]) -> Result<Vec<CotpOptions>, CotpError> {
 			0xc0 => {
 				let end = start.checked_add(3).context(NotEnoughBytes)?;
 				let tpdu_size = TpduSize::from_bytes(
-					bytes.get(start..end).context(NotEnoughBytes)?.try_into().context(SizedSlice)?,
+					bytes
+						.get(start..end)
+						.context(NotEnoughBytes)?
+						.try_into()
+						.context(SizedSlice)?,
 				)?;
 				options.push(CotpOptions::TpduSize(tpdu_size));
 				start = end;
@@ -849,9 +849,7 @@ pub enum CotpError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
-	#[snafu(display(
-		"Reassembled COTP payload exceeds {limit} bytes; aborting to avoid OOM"
-	))]
+	#[snafu(display("Reassembled COTP payload exceeds {limit} bytes; aborting to avoid OOM"))]
 	ReassemblyTooLarge {
 		limit: usize,
 		#[snafu(implicit)]
@@ -1426,10 +1424,7 @@ mod tests {
 			CotpOptions::TSelDst(TselDst { value: big.clone() }),
 			CotpOptions::TSelDst(TselDst { value: big }),
 		];
-		assert!(matches!(
-			CrTpdu::new(0, 1, options),
-			Err(CotpError::CrCcTooLarge { .. })
-		));
+		assert!(matches!(CrTpdu::new(0, 1, options), Err(CotpError::CrCcTooLarge { .. })));
 	}
 
 	#[tokio::test]
@@ -1444,7 +1439,7 @@ mod tests {
 			0,
 			(tpkt_len >> 8) as u8,
 			tpkt_len as u8,
-			0x02,            // LI
+			0x02, // LI
 			TpduType::DT as u8,
 			Eot::NoEot as u8,
 		];

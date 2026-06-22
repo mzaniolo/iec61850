@@ -514,8 +514,7 @@ impl ConnectSpdu {
 					)?);
 				}
 				Pgi::UserData => {
-					user_data =
-						Some(bytes.get(offset..end).context(NotEnoughBytes)?.to_vec());
+					user_data = Some(bytes.get(offset..end).context(NotEnoughBytes)?.to_vec());
 					break;
 				}
 				Pgi::Unknown49
@@ -982,9 +981,7 @@ impl RefuseSpdu {
 			offset += 1 + li_consumed;
 			let end = offset.checked_add(param_len).context(NotEnoughBytes)?;
 			if id == Pi::ReasonCode as u8 && param_len >= 1 {
-				return Ok(Self {
-					reason_code: *conn.get(offset).context(NotEnoughBytes)?,
-				});
+				return Ok(Self { reason_code: *conn.get(offset).context(NotEnoughBytes)? });
 			}
 			offset = end;
 		}
