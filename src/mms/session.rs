@@ -81,10 +81,15 @@ impl Session {
 		self.cotp_connection.send_data(spdu_bytes).await?;
 		let response = self.cotp_connection.receive_data().await?;
 		let response_spdu = Spdu::from_bytes(&response)?;
-		if let Spdu::Accept(accept_spdu) = response_spdu {
-			Ok(accept_spdu.data)
-		} else {
-			InvalidCotpResponse.fail()
+		match response_spdu {
+			Spdu::Accept(accept_spdu) => Ok(accept_spdu.data),
+			// Surface the peer's rejection reason instead of a generic
+			// "invalid response" so callers can distinguish a refused
+			// association from a protocol error.
+			Spdu::Refuse(refuse) => ConnectionRefused { reason_code: refuse.reason_code }.fail(),
+			Spdu::Abort(_) => ConnectionAborted.fail(),
+			Spdu::Disconnect(_) | Spdu::Finish(_) => ConnectionRefused { reason_code: 0 }.fail(),
+			_ => InvalidCotpResponse.fail(),
 		}
 	}
 	/// Split the connection into a read half and a write half.
@@ -1081,8 +1086,14 @@ pub enum SessionError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
-	#[snafu(display("Connection refused by peer"))]
+	#[snafu(display("Connection refused by peer (reason code {reason_code})"))]
 	ConnectionRefused {
+		reason_code: u8,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
+	#[snafu(display("Connection aborted by peer"))]
+	ConnectionAborted {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
@@ -1146,7 +1157,8 @@ impl SessionError {
 			SessionError::MessageTooShort { context } => context,
 			SessionError::InvalidLength { context } => context,
 			SessionError::InvalidDataSpdu { context } => context,
-			SessionError::ConnectionRefused { context } => context,
+			SessionError::ConnectionRefused { context, .. } => context,
+			SessionError::ConnectionAborted { context } => context,
 			SessionError::UnexpectedEndOfMessage { context } => context,
 			SessionError::InvalidParameterLength { context } => context,
 			SessionError::InvalidSelectorSize { context } => context,
@@ -1302,5 +1314,17 @@ mod tests {
 		let invalid_bytes = vec![0xFF, 0x00];
 		let result = Spdu::from_bytes(&invalid_bytes);
 		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_refuse_spdu_roundtrip_carries_reason() {
+		// A Refuse SPDU should parse back with its reason code intact so the
+		// connect path can surface it.
+		let refuse = RefuseSpdu::new(0x05);
+		let bytes = refuse.to_bytes();
+		let Spdu::Refuse(parsed) = Spdu::from_bytes(&bytes).unwrap() else {
+			panic!("expected Refuse SPDU");
+		};
+		assert_eq!(parsed.reason_code, 0x05);
 	}
 }

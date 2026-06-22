@@ -160,8 +160,15 @@ impl CotpReadHalf {
 			let tpkt = Self::read_tpkt(connection).await.inspect_err(|e| {
 				tracing::error!("Error reading TPKT: {:?}", e);
 			})?;
-			let Cotp::Dt(dt) = tpkt.cotp else {
-				return WrongCotpType.fail();
+			let dt = match tpkt.cotp {
+				Cotp::Dt(dt) => dt,
+				// A DR/DC mid-stream is the peer tearing down the transport
+				// connection (e.g. on graceful shutdown). Surface it as a
+				// clean, typed disconnect instead of WrongCotpType so the
+				// upper layers can distinguish it from a protocol violation.
+				Cotp::Dr(dr) => return PeerDisconnected { reason: dr.reason }.fail(),
+				Cotp::Dc(_) => return PeerDisconnected { reason: 0 }.fail(),
+				_ => return WrongCotpType.fail(),
 			};
 			if data.len().saturating_add(dt.data.len()) > COTP_MAX_REASSEMBLED_SIZE {
 				return ReassemblyTooLarge { limit: COTP_MAX_REASSEMBLED_SIZE }.fail();
@@ -279,6 +286,10 @@ enum Cotp {
 	Cc(CcTpdu),
 	/// The DT TPDU.
 	Dt(DtTpdu),
+	/// The DR (Disconnect Request) TPDU.
+	Dr(DrTpdu),
+	/// The DC (Disconnect Confirm) TPDU.
+	Dc(DcTpdu),
 }
 
 impl Cotp {
@@ -289,6 +300,8 @@ impl Cotp {
 			TpduType::CR => CrTpdu::from_bytes(bytes).map(Self::Cr),
 			TpduType::CC => CcTpdu::from_bytes(bytes).map(Self::Cc),
 			TpduType::DT => DtTpdu::from_bytes(bytes).map(Self::Dt),
+			TpduType::DR => DrTpdu::from_bytes(bytes).map(Self::Dr),
+			TpduType::DC => DcTpdu::from_bytes(bytes).map(Self::Dc),
 			_ => InvalidTpduType {
 				value: *bytes.get(1).context(NotEnoughBytes)?,
 				expected: TpduType::Invalid,
@@ -303,6 +316,8 @@ impl Cotp {
 			Self::Cr(tpdu) => tpdu.to_bytes(),
 			Self::Cc(tpdu) => tpdu.to_bytes(),
 			Self::Dt(tpdu) => tpdu.to_bytes(),
+			Self::Dr(tpdu) => tpdu.to_bytes(),
+			Self::Dc(tpdu) => tpdu.to_bytes(),
 		}
 	}
 
@@ -312,6 +327,8 @@ impl Cotp {
 			Self::Cr(tpdu) => tpdu.len(),
 			Self::Cc(tpdu) => tpdu.len(),
 			Self::Dt(tpdu) => tpdu.len(),
+			Self::Dr(tpdu) => tpdu.len(),
+			Self::Dc(tpdu) => tpdu.len(),
 		}
 	}
 }
@@ -326,6 +343,10 @@ pub enum TpduType {
 	CC = 0xd0,
 	/// The DT TPDU type.
 	DT = 0xf0,
+	/// The DR (Disconnect Request) TPDU type.
+	DR = 0x80,
+	/// The DC (Disconnect Confirm) TPDU type.
+	DC = 0xc0,
 	/// The invalid TPDU type.
 	Invalid = 0xff,
 }
@@ -337,6 +358,8 @@ impl From<u8> for TpduType {
 			val if val == TpduType::CR as u8 => TpduType::CR,
 			val if val == TpduType::CC as u8 => TpduType::CC,
 			val if val == TpduType::DT as u8 => TpduType::DT,
+			val if val == TpduType::DR as u8 => TpduType::DR,
+			val if val == TpduType::DC as u8 => TpduType::DC,
 			_ => TpduType::Invalid,
 		}
 	}
@@ -535,6 +558,103 @@ impl DtTpdu {
 	/// Get the length of the DT TPDU.
 	const fn len(&self) -> usize {
 		3 + self.data.len()
+	}
+}
+
+/// The DR (Disconnect Request) TPDU. Sent by either peer to tear down the
+/// transport connection (RFC 905 §13.5).
+#[derive(Debug, Clone)]
+struct DrTpdu {
+	/// The destination reference.
+	dst_ref: u16,
+	/// The source reference.
+	src_ref: u16,
+	/// The disconnect reason code.
+	reason: u8,
+}
+
+impl DrTpdu {
+	/// Parse a DR TPDU from bytes.
+	#[instrument(level = "debug")]
+	fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
+		if *bytes.get(1).context(NotEnoughBytes)? != TpduType::DR as u8 {
+			return InvalidTpduType {
+				value: *bytes.get(1).context(NotEnoughBytes)?,
+				expected: TpduType::DR,
+			}
+			.fail();
+		}
+		let dst_ref = u16::from_be_bytes(
+			bytes.get(2..4).context(NotEnoughBytes)?.try_into().context(SizedSlice)?,
+		);
+		let src_ref = u16::from_be_bytes(
+			bytes.get(4..6).context(NotEnoughBytes)?.try_into().context(SizedSlice)?,
+		);
+		let reason = *bytes.get(6).context(NotEnoughBytes)?;
+		Ok(Self { dst_ref, src_ref, reason })
+	}
+
+	/// Convert a DR TPDU to a byte array.
+	fn to_bytes(&self) -> Vec<u8> {
+		let mut bytes = Vec::with_capacity(8);
+		bytes.push(6); // LI = 6 (header after LI, excluding variable part)
+		bytes.push(TpduType::DR as u8);
+		bytes.extend_from_slice(&self.dst_ref.to_be_bytes());
+		bytes.extend_from_slice(&self.src_ref.to_be_bytes());
+		bytes.push(self.reason);
+		bytes
+	}
+
+	/// Get the length of the DR TPDU.
+	#[allow(clippy::unused_self)] // instance method for the Cotp::len() match
+	const fn len(&self) -> usize {
+		7
+	}
+}
+
+/// The DC (Disconnect Confirm) TPDU. Acknowledges a DR (RFC 905 §13.6).
+#[derive(Debug, Clone)]
+struct DcTpdu {
+	/// The destination reference.
+	dst_ref: u16,
+	/// The source reference.
+	src_ref: u16,
+}
+
+impl DcTpdu {
+	/// Parse a DC TPDU from bytes.
+	#[instrument(level = "debug")]
+	fn from_bytes(bytes: &[u8]) -> Result<Self, CotpError> {
+		if *bytes.get(1).context(NotEnoughBytes)? != TpduType::DC as u8 {
+			return InvalidTpduType {
+				value: *bytes.get(1).context(NotEnoughBytes)?,
+				expected: TpduType::DC,
+			}
+			.fail();
+		}
+		let dst_ref = u16::from_be_bytes(
+			bytes.get(2..4).context(NotEnoughBytes)?.try_into().context(SizedSlice)?,
+		);
+		let src_ref = u16::from_be_bytes(
+			bytes.get(4..6).context(NotEnoughBytes)?.try_into().context(SizedSlice)?,
+		);
+		Ok(Self { dst_ref, src_ref })
+	}
+
+	/// Convert a DC TPDU to a byte array.
+	fn to_bytes(&self) -> Vec<u8> {
+		let mut bytes = Vec::with_capacity(7);
+		bytes.push(5); // LI = 5
+		bytes.push(TpduType::DC as u8);
+		bytes.extend_from_slice(&self.dst_ref.to_be_bytes());
+		bytes.extend_from_slice(&self.src_ref.to_be_bytes());
+		bytes
+	}
+
+	/// Get the length of the DC TPDU.
+	#[allow(clippy::unused_self)] // instance method for the Cotp::len() match
+	const fn len(&self) -> usize {
+		6
 	}
 }
 
@@ -861,6 +981,12 @@ pub enum CotpError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
+	#[snafu(display("Peer disconnected the transport connection (reason={reason})"))]
+	PeerDisconnected {
+		reason: u8,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	#[snafu(whatever, display("{message}{context}\n{source:?}"))]
 	Whatever {
 		message: String,
@@ -893,6 +1019,7 @@ impl CotpError {
 			CotpError::NotEnoughBytes { context } => context,
 			CotpError::ReassemblyTooLarge { context, .. } => context,
 			CotpError::CrCcTooLarge { context, .. } => context,
+			CotpError::PeerDisconnected { context, .. } => context,
 			CotpError::Whatever { context, .. } => context,
 		}
 	}
@@ -1363,6 +1490,49 @@ mod tests {
 		let decoded = DtTpdu::from_bytes(&bytes).unwrap();
 		assert_eq!(decoded.eot, Eot::Eot);
 		assert_eq!(decoded.data, TEST_DATA_LARGE);
+	}
+
+	#[test]
+	fn test_dr_tpdu_roundtrip() {
+		let dr = DrTpdu { dst_ref: 0x1234, src_ref: 0x5678, reason: 0x80 };
+		let bytes = dr.to_bytes();
+		assert_eq!(bytes[0], 6); // LI
+		assert_eq!(bytes[1], 0x80); // DR type
+		assert_eq!(&bytes[2..4], &[0x12, 0x34]);
+		assert_eq!(&bytes[4..6], &[0x56, 0x78]);
+		assert_eq!(bytes[6], 0x80); // reason
+
+		let decoded = DrTpdu::from_bytes(&bytes).unwrap();
+		assert_eq!(decoded.dst_ref, 0x1234);
+		assert_eq!(decoded.src_ref, 0x5678);
+		assert_eq!(decoded.reason, 0x80);
+
+		// And dispatches through the Cotp enum.
+		assert!(matches!(Cotp::from_bytes(&bytes), Ok(Cotp::Dr(_))));
+	}
+
+	#[test]
+	fn test_dc_tpdu_roundtrip() {
+		let dc = DcTpdu { dst_ref: 0x1234, src_ref: 0x5678 };
+		let bytes = dc.to_bytes();
+		assert_eq!(bytes[0], 5); // LI
+		assert_eq!(bytes[1], 0xc0); // DC type
+		let decoded = DcTpdu::from_bytes(&bytes).unwrap();
+		assert_eq!(decoded.dst_ref, 0x1234);
+		assert_eq!(decoded.src_ref, 0x5678);
+		assert!(matches!(Cotp::from_bytes(&bytes), Ok(Cotp::Dc(_))));
+	}
+
+	#[tokio::test]
+	async fn test_receive_data_clean_disconnect_on_dr() {
+		// A DR TPDU arriving where data is expected must surface as a clean
+		// PeerDisconnected error rather than WrongCotpType.
+		let dr = DrTpdu { dst_ref: 1, src_ref: 2, reason: 0 };
+		let tpkt = Tpkt::from_cotp(Cotp::Dr(dr));
+		let bytes = tpkt.to_bytes();
+		let mut cursor = &bytes[..];
+		let result = CotpReadHalf::receive_data_from(&mut cursor).await;
+		assert!(matches!(result, Err(CotpError::PeerDisconnected { reason: 0, .. })));
 	}
 
 	#[test]
