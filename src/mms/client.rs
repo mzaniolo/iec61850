@@ -49,6 +49,12 @@ enum Command {
 		/// Channel the handler uses to deliver the cancel result.
 		responder: oneshot::Sender<CancelResult>,
 	},
+	/// Begin a graceful teardown: send an MMS Conclude-Request, then stop
+	/// the loop (which drops the transport and closes the TCP socket).
+	Shutdown {
+		/// Signaled once the teardown PDU has been written (best-effort).
+		responder: oneshot::Sender<()>,
+	},
 }
 
 /// Structured server-side failure for a confirmed service request, carried
@@ -567,6 +573,34 @@ impl MmsClient {
 			Err(failure) => ServiceFailed { failure }.fail(),
 		}
 	}
+
+	/// Gracefully close the connection.
+	///
+	/// Sends an MMS Conclude-Request and then drops the transport (which
+	/// closes the TCP socket). This is the pragmatic teardown used by most
+	/// IEC 61850 clients; it does not send an ACSE RLRQ. Any requests still
+	/// in flight are completed with `ServiceFailure::ConnectionClosed`.
+	///
+	/// Consumes the client; the connection is unusable afterwards.
+	#[instrument(skip(self))]
+	pub async fn close(self) -> Result<(), MmsClientError> {
+		let (tx, rx) = oneshot::channel();
+		// If the handler is already gone the connection is effectively
+		// closed, so treat a send failure as success.
+		if self.tx.send(Command::Shutdown { responder: tx }).await.is_err() {
+			return Ok(());
+		}
+		// Best-effort: wait (bounded) for the teardown PDU to be written.
+		match self.request_timeout {
+			Some(timeout) => {
+				let _ = tokio::time::timeout(timeout, rx).await;
+			}
+			None => {
+				let _ = rx.await;
+			}
+		}
+		Ok(())
+	}
 }
 
 /// The handler for the MMS connection.
@@ -712,12 +746,23 @@ impl ConnectionHandler {
 				return LoopAction::Break(reason);
 			}
 			MMSpdu::conclude_RequestPDU(_) => {
-				// The ASN.1 module doesn't expose conclude-ResponsePDU yet,
-				// so we can't reply politely. Stop the loop so waiters learn
-				// the connection is closing.
+				// Peer is closing gracefully. Reply with a Conclude-Response
+				// (best-effort) and then stop the loop so waiters learn the
+				// connection is closing.
+				let pdu = MMSpdu::conclude_ResponsePDU(ConcludeResponsePDU(()));
+				if let Ok(data) = ber::encode(&pdu).context(EncodeRequest)
+					&& let Err(e) = self.write_half.send_data(data).await
+				{
+					tracing::warn!("Error writing conclude-Response: {e}");
+				}
 				let reason = "peer sent conclude-Request".to_owned();
 				tracing::info!("{}", reason);
 				return LoopAction::Break(reason);
+			}
+			MMSpdu::conclude_ResponsePDU(_) => {
+				// Peer acknowledged our Conclude-Request; the loop will exit
+				// via the Shutdown path that initiated it.
+				tracing::debug!("Received conclude-Response from peer");
 			}
 			_ => {
 				tracing::error!("Unexpected service response. Response: {:?}", response);
@@ -738,6 +783,18 @@ impl ConnectionHandler {
 			}
 			Some(Command::Cancel { original_invoke_id, responder }) => {
 				self.handle_cancel_command(original_invoke_id, responder).await
+			}
+			Some(Command::Shutdown { responder }) => {
+				// Best-effort graceful close: write a Conclude-Request, then
+				// stop the loop so the transport is dropped (TCP FIN).
+				let pdu = MMSpdu::conclude_RequestPDU(ConcludeRequestPDU(()));
+				if let Ok(data) = ber::encode(&pdu).context(EncodeRequest)
+					&& let Err(e) = self.write_half.send_data(data).await
+				{
+					tracing::warn!("Error writing conclude-Request during close: {e}");
+				}
+				let _ = responder.send(());
+				LoopAction::Break("local close".to_owned())
 			}
 			None => LoopAction::Break("client dropped".to_owned()),
 		}
