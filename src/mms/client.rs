@@ -29,6 +29,28 @@ const MIN_PDU_SIZE: i32 = 64;
 /// reported by the peer (Confirmed-Error or Reject PDU).
 type ServiceResult = Result<ConfirmedServiceResponse, ServiceFailure>;
 
+/// Result of a Cancel request: `Ok` if the peer confirmed the cancel,
+/// `Err` with the structured failure otherwise.
+type CancelResult = Result<(), ServiceFailure>;
+
+/// A command sent from an `MmsClient` handle to the connection-handler task.
+enum Command {
+	/// A confirmed service request awaiting a response.
+	Request {
+		/// The service request to encode and send.
+		request: ConfirmedServiceRequest,
+		/// Channel the handler uses to deliver the response/failure.
+		responder: oneshot::Sender<ServiceResult>,
+	},
+	/// Cancel an outstanding confirmed request by its original invoke id.
+	Cancel {
+		/// The invoke id of the request to cancel.
+		original_invoke_id: u32,
+		/// Channel the handler uses to deliver the cancel result.
+		responder: oneshot::Sender<CancelResult>,
+	},
+}
+
 /// Structured server-side failure for a confirmed service request, carried
 /// back to the caller instead of an opaque dropped-channel error.
 #[derive(Debug, Clone)]
@@ -69,9 +91,9 @@ const PARAMETER_SUPPORT_OPTIONS: [u8; 2] = [0xf1, 0x00];
 /// The MMS client.
 #[derive(Debug)]
 pub struct MmsClient {
-	/// Sender used to hand confirmed service requests to the connection
+	/// Sender used to hand commands (requests, cancels) to the connection
 	/// handler task.
-	tx: mpsc::Sender<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
+	tx: mpsc::Sender<Command>,
 	/// Per-request timeout, copied from `ClientConfig` at connect time.
 	request_timeout: Option<Duration>,
 	/// MMS PDU size negotiated with the peer; we refuse to send PDUs larger
@@ -195,7 +217,10 @@ impl MmsClient {
 		let permit =
 			self.outstanding.clone().acquire_owned().await.map_err(|_| ConnectionGone.build())?;
 		let (tx, rx) = oneshot::channel();
-		self.tx.send((request, tx)).await.map_err(|_| ConnectionGone.build())?;
+		self.tx
+			.send(Command::Request { request, responder: tx })
+			.await
+			.map_err(|_| ConnectionGone.build())?;
 
 		let result = match self.request_timeout {
 			Some(timeout) => tokio::time::timeout(timeout, rx)
@@ -488,6 +513,60 @@ impl MmsClient {
 		}
 		Ok(list_of_directory_entry)
 	}
+
+	/// Rename a file on the server.
+	#[instrument(skip(self))]
+	pub async fn file_rename(
+		&self,
+		current_file_name: Vec<String>,
+		new_file_name: Vec<String>,
+	) -> Result<(), MmsClientError> {
+		let to_file_name = |names: Vec<String>| {
+			names
+				.into_iter()
+				.map(|name| {
+					GraphicString::from_bytes(name.as_bytes())
+						.map(AnonymousFileName)
+						.context(VisibleStringConversion)
+				})
+				.collect::<Result<Vec<_>, _>>()
+				.map(FileName)
+		};
+		let request = ConfirmedServiceRequest::fileRename(FileRenameRequest::new(
+			to_file_name(current_file_name)?,
+			to_file_name(new_file_name)?,
+		));
+		let response = self.send_request(request).await?;
+		if !matches!(response, ConfirmedServiceResponse::fileRename(_)) {
+			return UnexpectedServiceResponse.fail();
+		}
+		Ok(())
+	}
+
+	/// Cancel an outstanding confirmed request by its original invoke id.
+	///
+	/// Returns `Ok(())` when the peer confirms the cancellation. Note the
+	/// invoke id is the MMS protocol id assigned internally; this is a
+	/// best-effort control operation primarily useful for long-running
+	/// services.
+	#[instrument(skip(self))]
+	pub async fn cancel(&self, original_invoke_id: u32) -> Result<(), MmsClientError> {
+		let (tx, rx) = oneshot::channel();
+		self.tx
+			.send(Command::Cancel { original_invoke_id, responder: tx })
+			.await
+			.map_err(|_| ConnectionGone.build())?;
+		let result = match self.request_timeout {
+			Some(timeout) => tokio::time::timeout(timeout, rx)
+				.await
+				.map_err(|_| RequestTimeout { timeout }.build())?,
+			None => rx.await,
+		};
+		match result.context(ReceiveResponse)? {
+			Ok(()) => Ok(()),
+			Err(failure) => ServiceFailed { failure }.fail(),
+		}
+	}
 }
 
 /// The handler for the MMS connection.
@@ -496,10 +575,13 @@ struct ConnectionHandler {
 	read_half: AcseReadHalf,
 	/// The write half.
 	write_half: AcseWriteHalf,
-	/// The receiver for the confirmed service requests.
-	rx: mpsc::Receiver<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
-	/// The map of the response senders.
+	/// The receiver for commands from `MmsClient` handles.
+	rx: mpsc::Receiver<Command>,
+	/// The map of the response senders, keyed by invoke id.
 	response_map: HashMap<u32, oneshot::Sender<ServiceResult>>,
+	/// Pending cancel requests, keyed by the original invoke id being
+	/// cancelled.
+	cancel_map: HashMap<u32, oneshot::Sender<CancelResult>>,
 	/// The report callback.
 	report_callback: Box<dyn ReportCallback + Send + Sync>,
 	/// MMS PDU size negotiated with the peer; encoded requests larger than
@@ -514,7 +596,7 @@ impl ConnectionHandler {
 	pub fn new(
 		read_half: AcseReadHalf,
 		write_half: AcseWriteHalf,
-		rx: mpsc::Receiver<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
+		rx: mpsc::Receiver<Command>,
 		report_callback: Box<dyn ReportCallback + Send + Sync>,
 		max_pdu_size: usize,
 	) -> Self {
@@ -523,6 +605,7 @@ impl ConnectionHandler {
 			write_half,
 			rx,
 			response_map: HashMap::new(),
+			cancel_map: HashMap::new(),
 			report_callback,
 			max_pdu_size,
 		}
@@ -553,6 +636,10 @@ impl ConnectionHandler {
 		// Drain any waiters so callers get a typed error instead of an
 		// opaque oneshot RecvError.
 		for (_, sender) in self.response_map.drain() {
+			let _ =
+				sender.send(Err(ServiceFailure::ConnectionClosed { reason: close_reason.clone() }));
+		}
+		for (_, sender) in self.cancel_map.drain() {
 			let _ =
 				sender.send(Err(ServiceFailure::ConnectionClosed { reason: close_reason.clone() }));
 		}
@@ -595,6 +682,26 @@ impl ConnectionHandler {
 			MMSpdu::rejectPDU(response) => {
 				self.handle_rejected_pdu(response).await;
 			}
+			MMSpdu::cancel_ResponsePDU(response) => {
+				let id = response.0.0;
+				if let Some(sender) = self.cancel_map.remove(&id) {
+					let _ = sender.send(Ok(()));
+				} else {
+					tracing::warn!("cancel-Response for unknown invoke id {id}");
+				}
+			}
+			MMSpdu::cancel_ErrorPDU(response) => {
+				let id = response.original_invoke_id.0;
+				if let Some(sender) = self.cancel_map.remove(&id) {
+					let failure = ServiceFailure::ConfirmedError {
+						modifier_position: None,
+						service_error: response.service_error,
+					};
+					let _ = sender.send(Err(failure));
+				} else {
+					tracing::warn!("cancel-Error for unknown invoke id {id}");
+				}
+			}
 			MMSpdu::initiate_ResponsePDU(response) => {
 				tracing::warn!("Unexpected initiate-Response after connect: {:?}", response);
 			}
@@ -619,28 +726,43 @@ impl ConnectionHandler {
 		LoopAction::Continue
 	}
 
-	/// Handle one outgoing request from the rx channel.
+	/// Handle one command from the rx channel.
 	async fn handle_outgoing(
 		&mut self,
-		request: Option<(ConfirmedServiceRequest, oneshot::Sender<ServiceResult>)>,
+		command: Option<Command>,
 		invoke_id: &mut u32,
 	) -> LoopAction {
-		let Some((request, sender)) = request else {
-			return LoopAction::Break("client dropped".to_owned());
-		};
+		match command {
+			Some(Command::Request { request, responder }) => {
+				self.handle_request_command(request, responder, invoke_id).await
+			}
+			Some(Command::Cancel { original_invoke_id, responder }) => {
+				self.handle_cancel_command(original_invoke_id, responder).await
+			}
+			None => LoopAction::Break("client dropped".to_owned()),
+		}
+	}
+
+	/// Encode and send a confirmed service request, registering its waiter.
+	async fn handle_request_command(
+		&mut self,
+		request: ConfirmedServiceRequest,
+		responder: oneshot::Sender<ServiceResult>,
+		invoke_id: &mut u32,
+	) -> LoopAction {
 		let id = self.next_free_invoke_id(invoke_id);
 		let data = match prepare_request(id, request) {
 			Ok(data) => data,
 			Err(e) => {
 				tracing::error!("Error preparing request: {:?}", e);
-				let _ = sender.send(Err(ServiceFailure::ConnectionClosed {
+				let _ = responder.send(Err(ServiceFailure::ConnectionClosed {
 					reason: format!("encode failed: {e}"),
 				}));
 				return LoopAction::Continue;
 			}
 		};
 		if self.max_pdu_size > 0 && data.len() > self.max_pdu_size {
-			let _ = sender.send(Err(ServiceFailure::PduTooLarge {
+			let _ = responder.send(Err(ServiceFailure::PduTooLarge {
 				encoded: data.len(),
 				limit: self.max_pdu_size,
 			}));
@@ -649,10 +771,39 @@ impl ConnectionHandler {
 		if let Err(e) = self.write_half.send_data(data).await {
 			let reason = format!("send failed: {e}");
 			tracing::error!("{}", reason);
-			let _ = sender.send(Err(ServiceFailure::ConnectionClosed { reason: reason.clone() }));
+			let _ =
+				responder.send(Err(ServiceFailure::ConnectionClosed { reason: reason.clone() }));
 			return LoopAction::Break(reason);
 		}
-		self.response_map.insert(id, sender);
+		self.response_map.insert(id, responder);
+		LoopAction::Continue
+	}
+
+	/// Encode and send a Cancel-Request, registering its waiter keyed by the
+	/// original invoke id.
+	async fn handle_cancel_command(
+		&mut self,
+		original_invoke_id: u32,
+		responder: oneshot::Sender<CancelResult>,
+	) -> LoopAction {
+		let pdu = MMSpdu::cancel_RequestPDU(CancelRequestPDU(Unsigned32(original_invoke_id)));
+		let data = match ber::encode(&pdu).context(EncodeRequest) {
+			Ok(data) => data,
+			Err(e) => {
+				let _ = responder.send(Err(ServiceFailure::ConnectionClosed {
+					reason: format!("encode failed: {e}"),
+				}));
+				return LoopAction::Continue;
+			}
+		};
+		if let Err(e) = self.write_half.send_data(data).await {
+			let reason = format!("send failed: {e}");
+			tracing::error!("{}", reason);
+			let _ =
+				responder.send(Err(ServiceFailure::ConnectionClosed { reason: reason.clone() }));
+			return LoopAction::Break(reason);
+		}
+		self.cancel_map.insert(original_invoke_id, responder);
 		LoopAction::Continue
 	}
 
