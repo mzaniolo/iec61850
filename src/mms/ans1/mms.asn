@@ -11,10 +11,14 @@ MMSpdu ::= CHOICE {
     confirmed-ErrorPDU      [2]     IMPLICIT Confirmed-ErrorPDU,
     unconfirmed-PDU         [3]     IMPLICIT Unconfirmed-PDU,
     rejectPDU               [4]     IMPLICIT RejectPDU,
+    cancel-RequestPDU       [5]     IMPLICIT Cancel-RequestPDU,
+    cancel-ResponsePDU      [6]     IMPLICIT Cancel-ResponsePDU,
+    cancel-ErrorPDU         [7]     IMPLICIT Cancel-ErrorPDU,
     initiate-RequestPDU     [8]     IMPLICIT Initiate-RequestPDU,
     initiate-ResponsePDU    [9]     IMPLICIT Initiate-ResponsePDU,
     initiate-ErrorPDU       [10]    IMPLICIT Initiate-ErrorPDU,
-    conclude-RequestPDU     [11]    IMPLICIT Conclude-RequestPDU
+    conclude-RequestPDU     [11]    IMPLICIT Conclude-RequestPDU,
+    conclude-ResponsePDU    [12]    IMPLICIT Conclude-ResponsePDU
 }
 
 Confirmed-RequestPDU ::= SEQUENCE {
@@ -34,7 +38,8 @@ ConfirmedServiceRequest ::= CHOICE {
     fileRead                        [73]    IMPLICIT    FileRead-Request,
     fileClose                       [74]    IMPLICIT    FileClose-Request,
     fileDelete                      [76]    IMPLICIT    FileDelete-Request,
-    fileDirectory                   [77]    IMPLICIT    FileDirectory-Request
+    fileDirectory                   [77]    IMPLICIT    FileDirectory-Request,
+    fileRename                      [75]    IMPLICIT    FileRename-Request
 }
 
 Unconfirmed-PDU ::= SEQUENCE {
@@ -62,7 +67,8 @@ ConfirmedServiceResponse ::= CHOICE {
     fileRead                        [73]    IMPLICIT FileRead-Response,
     fileClose                       [74]    IMPLICIT FileClose-Response,
     fileDelete                      [76]    IMPLICIT FileDelete-Response,
-    fileDirectory                   [77]    IMPLICIT FileDirectory-Response
+    fileDirectory                   [77]    IMPLICIT FileDirectory-Response,
+    fileRename                      [75]    IMPLICIT FileRename-Response
 }
 
 
@@ -271,6 +277,17 @@ Initiate-ResponsePDU ::= SEQUENCE {
 Initiate-ErrorPDU ::= ServiceError
 
 Conclude-RequestPDU ::= NULL
+
+Conclude-ResponsePDU ::= NULL
+
+Cancel-RequestPDU ::= Unsigned32 -- original invoke ID
+
+Cancel-ResponsePDU ::= Unsigned32 -- original invoke ID
+
+Cancel-ErrorPDU ::= SEQUENCE {
+    originalInvokeID    [0] IMPLICIT Unsigned32,
+    serviceError        [1] IMPLICIT ServiceError
+}
 
 
 RejectPDU ::= SEQUENCE
@@ -601,6 +618,13 @@ FileClose-Response ::= NULL
 FileDelete-Request ::= FileName
 
 FileDelete-Response ::= NULL
+
+FileRename-Request ::= SEQUENCE {
+    currentFileName [0] IMPLICIT FileName,
+    newFileName     [1] IMPLICIT FileName
+}
+
+FileRename-Response ::= NULL
 
 FileDirectory-Request ::= SEQUENCE {
     fileSpecification [0] IMPLICIT FileName OPTIONAL,

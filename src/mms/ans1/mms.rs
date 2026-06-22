@@ -213,9 +213,33 @@ pub mod asn1 {
 			Self::selectAccess(value)
 		}
 	}
+	#[doc = " original invoke ID"]
+	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+	#[rasn(identifier = "Cancel-ErrorPDU")]
+	pub struct CancelErrorPDU {
+		#[rasn(tag(context, 0), identifier = "originalInvokeID")]
+		pub original_invoke_id: Unsigned32,
+		#[rasn(tag(context, 1), identifier = "serviceError")]
+		pub service_error: ServiceError,
+	}
+	impl CancelErrorPDU {
+		pub fn new(original_invoke_id: Unsigned32, service_error: ServiceError) -> Self {
+			Self { original_invoke_id, service_error }
+		}
+	}
+	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+	#[rasn(delegate, identifier = "Cancel-RequestPDU")]
+	pub struct CancelRequestPDU(pub Unsigned32);
+	#[doc = " original invoke ID"]
+	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+	#[rasn(delegate, identifier = "Cancel-ResponsePDU")]
+	pub struct CancelResponsePDU(pub Unsigned32);
 	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash, Copy)]
 	#[rasn(delegate, identifier = "Conclude-RequestPDU")]
 	pub struct ConcludeRequestPDU(pub ());
+	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash, Copy)]
+	#[rasn(delegate, identifier = "Conclude-ResponsePDU")]
+	pub struct ConcludeResponsePDU(pub ());
 	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
 	#[rasn(identifier = "Confirmed-ErrorPDU")]
 	pub struct ConfirmedErrorPDU {
@@ -286,6 +310,8 @@ pub mod asn1 {
 		fileDelete(FileDeleteRequest),
 		#[rasn(tag(context, 77))]
 		fileDirectory(FileDirectoryRequest),
+		#[rasn(tag(context, 75))]
+		fileRename(FileRenameRequest),
 	}
 	impl From<GetNameListRequest> for ConfirmedServiceRequest {
 		fn from(value: GetNameListRequest) -> Self {
@@ -347,6 +373,11 @@ pub mod asn1 {
 			Self::fileDirectory(value)
 		}
 	}
+	impl From<FileRenameRequest> for ConfirmedServiceRequest {
+		fn from(value: FileRenameRequest) -> Self {
+			Self::fileRename(value)
+		}
+	}
 	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
 	#[rasn(choice)]
 	pub enum ConfirmedServiceResponse {
@@ -374,6 +405,8 @@ pub mod asn1 {
 		fileDelete(FileDeleteResponse),
 		#[rasn(tag(context, 77))]
 		fileDirectory(FileDirectoryResponse),
+		#[rasn(tag(context, 75))]
+		fileRename(FileRenameResponse),
 	}
 	impl From<GetNameListResponse> for ConfirmedServiceResponse {
 		fn from(value: GetNameListResponse) -> Self {
@@ -433,6 +466,11 @@ pub mod asn1 {
 	impl From<FileDirectoryResponse> for ConfirmedServiceResponse {
 		fn from(value: FileDirectoryResponse) -> Self {
 			Self::fileDirectory(value)
+		}
+	}
+	impl From<FileRenameResponse> for ConfirmedServiceResponse {
+		fn from(value: FileRenameResponse) -> Self {
+			Self::fileRename(value)
 		}
 	}
 	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
@@ -692,6 +730,22 @@ pub mod asn1 {
 		true
 	}
 	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
+	#[rasn(identifier = "FileRename-Request")]
+	pub struct FileRenameRequest {
+		#[rasn(tag(context, 0), identifier = "currentFileName")]
+		pub current_file_name: FileName,
+		#[rasn(tag(context, 1), identifier = "newFileName")]
+		pub new_file_name: FileName,
+	}
+	impl FileRenameRequest {
+		pub fn new(current_file_name: FileName, new_file_name: FileName) -> Self {
+			Self { current_file_name, new_file_name }
+		}
+	}
+	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash, Copy)]
+	#[rasn(delegate, identifier = "FileRename-Response")]
+	pub struct FileRenameResponse(pub ());
+	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
 	#[rasn(delegate)]
 	pub struct FloatingPoint(pub OctetString);
 	#[doc = " Inner type "]
@@ -936,6 +990,12 @@ pub mod asn1 {
 		unconfirmed_PDU(UnconfirmedPDU),
 		#[rasn(tag(context, 4))]
 		rejectPDU(RejectPDU),
+		#[rasn(tag(context, 5), identifier = "cancel-RequestPDU")]
+		cancel_RequestPDU(CancelRequestPDU),
+		#[rasn(tag(context, 6), identifier = "cancel-ResponsePDU")]
+		cancel_ResponsePDU(CancelResponsePDU),
+		#[rasn(tag(context, 7), identifier = "cancel-ErrorPDU")]
+		cancel_ErrorPDU(CancelErrorPDU),
 		#[rasn(tag(context, 8), identifier = "initiate-RequestPDU")]
 		initiate_RequestPDU(InitiateRequestPDU),
 		#[rasn(tag(context, 9), identifier = "initiate-ResponsePDU")]
@@ -944,6 +1004,8 @@ pub mod asn1 {
 		initiate_ErrorPDU(InitiateErrorPDU),
 		#[rasn(tag(context, 11), identifier = "conclude-RequestPDU")]
 		conclude_RequestPDU(ConcludeRequestPDU),
+		#[rasn(tag(context, 12), identifier = "conclude-ResponsePDU")]
+		conclude_ResponsePDU(ConcludeResponsePDU),
 	}
 	impl From<ConfirmedRequestPDU> for MMSpdu {
 		fn from(value: ConfirmedRequestPDU) -> Self {
@@ -970,6 +1032,21 @@ pub mod asn1 {
 			Self::rejectPDU(value)
 		}
 	}
+	impl From<CancelRequestPDU> for MMSpdu {
+		fn from(value: CancelRequestPDU) -> Self {
+			Self::cancel_RequestPDU(value)
+		}
+	}
+	impl From<CancelResponsePDU> for MMSpdu {
+		fn from(value: CancelResponsePDU) -> Self {
+			Self::cancel_ResponsePDU(value)
+		}
+	}
+	impl From<CancelErrorPDU> for MMSpdu {
+		fn from(value: CancelErrorPDU) -> Self {
+			Self::cancel_ErrorPDU(value)
+		}
+	}
 	impl From<InitiateRequestPDU> for MMSpdu {
 		fn from(value: InitiateRequestPDU) -> Self {
 			Self::initiate_RequestPDU(value)
@@ -988,6 +1065,11 @@ pub mod asn1 {
 	impl From<ConcludeRequestPDU> for MMSpdu {
 		fn from(value: ConcludeRequestPDU) -> Self {
 			Self::conclude_RequestPDU(value)
+		}
+	}
+	impl From<ConcludeResponsePDU> for MMSpdu {
+		fn from(value: ConcludeResponsePDU) -> Self {
+			Self::conclude_ResponsePDU(value)
 		}
 	}
 	#[derive(AsnType, Debug, Clone, Decode, Encode, PartialEq, Eq, Hash)]
