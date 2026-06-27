@@ -219,6 +219,8 @@ The connection initiates with the client sending a Initiate-RequestPDU. In this 
 
 For rpc style calls the client sends a Confirmed Service Request. This request contains the called service and a invocation id used to match the server response with the client request. The server then responds with a Confirmed Service Response or a Confirmed Error.
 
+The negotiated max PDU size bounds how large a single request may be. The client refuses to send a request whose encoded form exceeds that size. For a `read` of a list of variables the client recovers automatically by bisecting the variable list and issuing several reads, concatenating the results in order; a read of a single oversized variable or of a named variable list cannot be split and surfaces the size error to the caller.
+
 The server can also send unsolicited messages to notify clients. This messages are of the type Unconfirmed Requests and have no invoke id
 
 To close the association gracefully the client sends a Conclude-Request and the server replies with a Conclude-Response. The client implementation sends the Conclude-Request and then closes the underlying TCP connection (a pragmatic teardown; it does not additionally send an ACSE RLRQ). If the *server* initiates the close with a Conclude-Request, the client replies with a Conclude-Response before tearing down. A pending request that is still outstanding when the connection closes is completed locally with a "connection closed" error rather than hanging.

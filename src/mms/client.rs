@@ -1,6 +1,6 @@
 //! MMS client implementation.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use rasn::{ber, prelude::*};
 use snafu::{ResultExt as _, Snafu};
@@ -280,8 +280,40 @@ impl MmsClient {
 	}
 
 	/// Read data from the MMS server.
+	///
+	/// For a `listOfVariable` specification this automatically splits the
+	/// request when it would exceed the negotiated PDU size: the variable
+	/// list is bisected, read in multiple requests, and the results are
+	/// concatenated in order. A `variableListName` (named list) cannot be
+	/// split and a single variable whose request still exceeds the limit
+	/// returns `PduTooLarge`.
 	#[instrument(skip(self))]
 	pub async fn read(
+		&self,
+		variable_access_specification: VariableAccessSpecification,
+		specification_with_result: bool,
+	) -> Result<Vec<Data>, MmsClientError> {
+		match variable_access_specification {
+			// A list of variables can be split: if the request PDU is too
+			// large, bisect the list and concatenate the results in order.
+			VariableAccessSpecification::listOfVariable(VariableDefs(defs)) => {
+				let send = |chunk: Vec<AnonymousVariableDefs>| {
+					self.send_read(
+						VariableAccessSpecification::listOfVariable(VariableDefs(chunk)),
+						specification_with_result,
+					)
+				};
+				bisect(defs, &send).await
+			}
+			// A named variable list is a single object reference and cannot
+			// be split; send it as-is.
+			other => self.send_read(other, specification_with_result).await,
+		}
+	}
+
+	/// Issue a single Read request for the given access specification and
+	/// return the decoded data values.
+	async fn send_read(
 		&self,
 		variable_access_specification: VariableAccessSpecification,
 		specification_with_result: bool,
@@ -944,6 +976,42 @@ enum LoopAction {
 	Break(String),
 }
 
+/// Whether an error is the locally-generated "request PDU exceeds the
+/// negotiated maximum" failure, which a caller can recover from by splitting
+/// the request.
+const fn is_pdu_too_large(err: &MmsClientError) -> bool {
+	matches!(err, MmsClientError::ServiceFailed { failure: ServiceFailure::PduTooLarge { .. }, .. })
+}
+
+/// Send `items` via `send`; if that fails with `PduTooLarge` and there is
+/// more than one item, bisect the list and recurse, concatenating the
+/// results in order. A single item that is still too large (or any other
+/// error) is propagated unchanged.
+fn bisect<'a, T, R, F, Fut>(
+	items: Vec<T>,
+	send: &'a F,
+) -> Pin<Box<dyn Future<Output = Result<Vec<R>, MmsClientError>> + Send + 'a>>
+where
+	T: Clone + Send + 'a,
+	R: Send + 'a,
+	F: Fn(Vec<T>) -> Fut + Sync + 'a,
+	Fut: Future<Output = Result<Vec<R>, MmsClientError>> + Send + 'a,
+{
+	Box::pin(async move {
+		match send(items.clone()).await {
+			Ok(out) => Ok(out),
+			Err(e) if is_pdu_too_large(&e) && items.len() > 1 => {
+				let mut left = items;
+				let right = left.split_off(left.len() / 2);
+				let mut out = bisect(left, send).await?;
+				out.extend(bisect(right, send).await?);
+				Ok(out)
+			}
+			Err(e) => Err(e),
+		}
+	})
+}
+
 /// Pick the next unused invoke-id, wrapping on u32 overflow. The
 /// outstanding-requests semaphore already caps concurrent in-flight
 /// requests, so collisions are not expected; the linear scan is just a
@@ -1112,7 +1180,7 @@ impl From<AcseError> for MmsClientError {
 	}
 }
 
-#[allow(clippy::print_stdout, clippy::expect_used)]
+#[allow(clippy::print_stdout, clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
 	use rust_telemetry::config::OtelConfig;
@@ -1227,6 +1295,53 @@ mod tests {
 		let id = next_free_invoke_id(&mut counter, &in_flight);
 		assert_eq!(id, u32::MAX);
 		assert_eq!(counter, 0);
+	}
+
+	/// Build a `PduTooLarge` error for tests.
+	fn pdu_too_large_err() -> MmsClientError {
+		ServiceFailed { failure: ServiceFailure::PduTooLarge { encoded: 1000, limit: 100 } }.build()
+	}
+
+	#[tokio::test]
+	async fn test_bisect_preserves_order_and_splits() {
+		// A sender that only "fits" chunks of <= 2 items; larger chunks
+		// report PduTooLarge, forcing a split. On success it echoes each
+		// input item as its result so we can check order.
+		let send = |chunk: Vec<u32>| async move {
+			if chunk.len() > 2 { Err(pdu_too_large_err()) } else { Ok(chunk) }
+		};
+		let input: Vec<u32> = (0..10).collect();
+		let out = bisect(input.clone(), &send).await.unwrap();
+		assert_eq!(out, input, "results must come back in input order");
+	}
+
+	#[tokio::test]
+	async fn test_bisect_single_oversize_item_propagates() {
+		// Even a single item is too large: must propagate the error rather
+		// than loop forever.
+		let send = |_chunk: Vec<u32>| async move { Err::<Vec<u32>, _>(pdu_too_large_err()) };
+		let result = bisect(vec![42_u32], &send).await;
+		assert!(is_pdu_too_large(&result.unwrap_err()));
+	}
+
+	#[tokio::test]
+	async fn test_bisect_no_split_when_it_fits() {
+		// A sender that always succeeds should be called exactly once (no
+		// split): the returned vec equals the whole input.
+		let send = |chunk: Vec<u32>| async move { Ok(chunk) };
+		let input: Vec<u32> = (0..5).collect();
+		let out = bisect(input.clone(), &send).await.unwrap();
+		assert_eq!(out, input);
+	}
+
+	#[tokio::test]
+	async fn test_bisect_other_error_short_circuits() {
+		// A non-PduTooLarge error must propagate immediately without any
+		// splitting.
+		let send =
+			|_chunk: Vec<u32>| async move { Err::<Vec<u32>, _>(UnexpectedServiceResponse.build()) };
+		let result = bisect(vec![1_u32, 2, 3, 4], &send).await;
+		assert!(matches!(result, Err(MmsClientError::UnexpectedServiceResponse { .. })));
 	}
 
 	struct TestReportCallback;
