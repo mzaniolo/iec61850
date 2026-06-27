@@ -592,8 +592,12 @@ impl ConnectSpdu {
 					if param_len != 1 {
 						return InvalidParameterLength.fail();
 					}
+					// The Version Number PI is a bitfield: bit 0 (0x01) =
+					// version 1, bit 1 (0x02) = version 2. Accept a peer that
+					// offers either (or both) rather than requiring exactly
+					// version 2 — some servers advertise only version 1.
 					let version = *bytes.get(offset).context(NotEnoughBytes)?;
-					if version != 2 {
+					if version & 0b11 == 0 {
 						return InvalidVersion { value: version }.fail();
 					}
 					has_protocol_version = true;
@@ -1314,6 +1318,22 @@ mod tests {
 		let invalid_bytes = vec![0xFF, 0x00];
 		let result = Spdu::from_bytes(&invalid_bytes);
 		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_connect_accept_item_accepts_version_1_and_2() {
+		// Connect-accept-item body: ProtocolOptions PI (0x13, len 1, value 0)
+		// followed by VersionNumber PI (0x16, len 1, value).
+		let make = |version: u8| vec![0x13, 0x01, 0x00, 0x16, 0x01, version];
+		// Version 1 (bit 0) and version 2 (bit 1) and both must be accepted.
+		assert!(ConnectSpdu::parse_connect_accept_item(&make(0x01)).is_ok());
+		assert!(ConnectSpdu::parse_connect_accept_item(&make(0x02)).is_ok());
+		assert!(ConnectSpdu::parse_connect_accept_item(&make(0x03)).is_ok());
+		// An all-zero version field carries no known version and is rejected.
+		assert!(matches!(
+			ConnectSpdu::parse_connect_accept_item(&make(0x00)),
+			Err(SessionError::InvalidVersion { value: 0, .. })
+		));
 	}
 
 	#[test]

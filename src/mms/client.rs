@@ -88,10 +88,15 @@ pub enum ServiceFailure {
 		limit: usize,
 	},
 }
-/// The service support options.
+/// The service support options (servicesSupportedCalling), 85 bits.
+/// Byte-for-byte identical to the libiec61850 reference client's proposed
+/// set, which interoperates with IEC 61850-8-1 servers; verified against
+/// libiec61850 v1.5 `mms_client_initiate.c`.
 const SERVICE_SUPPORT_OPTIONS: [u8; 11] =
 	[0xee, 0x1c, 0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x79, 0xef, 0x18];
-/// The parameter support options.
+/// The parameter support options (parameterCBB), 11 bits. `0xf1` advertises
+/// str1, str2, vnam, vlis and valt — matching the libiec61850 reference
+/// client.
 const PARAMETER_SUPPORT_OPTIONS: [u8; 2] = [0xf1, 0x00];
 
 /// The MMS client.
@@ -307,6 +312,7 @@ impl MmsClient {
 		variable_access_specification: VariableAccessSpecification,
 		list_of_data: Vec<Data>,
 	) -> Result<(), MmsClientError> {
+		let expected_results = list_of_data.len();
 		let request = ConfirmedServiceRequest::write(WriteRequest::new(
 			variable_access_specification,
 			list_of_data,
@@ -315,6 +321,13 @@ impl MmsClient {
 		let ConfirmedServiceResponse::write(response) = response else {
 			return UnexpectedServiceResponse.fail();
 		};
+
+		// The Write-Response must carry exactly one result per data item
+		// written. An empty or short list is a malformed response and must
+		// not be silently reported as success.
+		if response.0.len() != expected_results {
+			return UnexpectedServiceResponse.fail();
+		}
 
 		response
 			.0

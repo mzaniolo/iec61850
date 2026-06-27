@@ -271,6 +271,10 @@ fn extract_pdv_by_context(
 			u64::try_from(&pdv.presentation_context_identifier.0).is_ok_and(|id| id == context_id)
 		})
 		.context(MissingPdv)?;
+	// When a transfer-syntax-name is present it must be BER. When absent it
+	// is implied by the single syntax negotiated for the context (always BER
+	// for the ACSE and MMS contexts we propose), so an absent name is
+	// correct per ISO 8823 and accepted.
 	if pdv.transfer_syntax_name.as_ref().is_some_and(|tsn| tsn.0 != *BER_OID_OBJECT_IDENTIFIER) {
 		return UnsupportedTransferSyntax.fail();
 	}
