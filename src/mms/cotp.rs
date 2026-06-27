@@ -73,7 +73,8 @@ impl CotpConnection {
 			.await
 			.whatever_context("Error writing to connection")?;
 
-		let tpkt = CotpReadHalf::read_tpkt(&mut connection).await?;
+		let tpkt =
+			CotpReadHalf::read_tpkt(&mut connection, config.connection.frame_read_timeout).await?;
 
 		if !matches!(tpkt.cotp, Cotp::Cc(_)) {
 			return WrongCotpType.fail();
@@ -95,7 +96,10 @@ impl CotpConnection {
 				.unwrap_or(COTP_MAX_TPDU_SIZE);
 			let (read_half, write_half) = tokio::io::split(connection);
 			return Ok(Self {
-				read_connection: CotpReadHalf { connection: read_half },
+				read_connection: CotpReadHalf {
+					connection: read_half,
+					frame_read_timeout: config.connection.frame_read_timeout,
+				},
 				write_connection: CotpWriteHalf { connection: write_half, tpdu_size },
 			});
 		}
@@ -135,6 +139,8 @@ impl WriteHalfConnection for CotpConnection {
 pub struct CotpReadHalf {
 	/// The read half of the connection.
 	connection: ReadHalf<Connection>,
+	/// Bounds the read of the rest of a frame once its header arrives.
+	frame_read_timeout: Option<Duration>,
 }
 
 #[async_trait]
@@ -143,7 +149,7 @@ impl ReadHalfConnection for CotpReadHalf {
 
 	#[instrument(skip(self))]
 	async fn receive_data(&mut self) -> Result<Vec<u8>, Self::Error> {
-		Self::receive_data_from(&mut self.connection).await
+		Self::receive_data_from(&mut self.connection, self.frame_read_timeout).await
 	}
 }
 
@@ -154,10 +160,11 @@ impl CotpReadHalf {
 	#[instrument(skip(connection))]
 	async fn receive_data_from<R: AsyncRead + Unpin>(
 		connection: &mut R,
+		frame_read_timeout: Option<Duration>,
 	) -> Result<Vec<u8>, CotpError> {
 		let mut data = Vec::new();
 		loop {
-			let tpkt = Self::read_tpkt(connection).await.inspect_err(|e| {
+			let tpkt = Self::read_tpkt(connection, frame_read_timeout).await.inspect_err(|e| {
 				tracing::error!("Error reading TPKT: {:?}", e);
 			})?;
 			let dt = match tpkt.cotp {
@@ -181,8 +188,17 @@ impl CotpReadHalf {
 	}
 
 	/// Read a TPKT from the connection.
+	///
+	/// The wait for the 4-byte header is intentionally unbounded: an idle
+	/// connection legitimately has no data while it waits for the next frame
+	/// (e.g. an unsolicited report). Once the header arrives, the rest of the
+	/// frame is expected promptly, so the payload read is bounded by
+	/// `frame_read_timeout` to defend against a peer that stalls mid-frame.
 	#[instrument(skip(connection))]
-	async fn read_tpkt<R: AsyncRead + Unpin>(connection: &mut R) -> Result<Tpkt, CotpError> {
+	async fn read_tpkt<R: AsyncRead + Unpin>(
+		connection: &mut R,
+		frame_read_timeout: Option<Duration>,
+	) -> Result<Tpkt, CotpError> {
 		let mut buffer = [0; TPKT_HEADER_SIZE];
 		connection
 			.read_exact(&mut buffer)
@@ -208,10 +224,14 @@ impl CotpReadHalf {
 		//TODO: This needs to be optimized. Make this static and always clean it before
 		// use.
 		let mut buffer = vec![0; payload_len];
-		connection
-			.read_exact(&mut buffer)
-			.await
-			.whatever_context("Error reading from connection")?;
+		let read_payload = connection.read_exact(&mut buffer);
+		match frame_read_timeout {
+			Some(timeout) => tokio::time::timeout(timeout, read_payload)
+				.await
+				.map_err(|_| FrameReadTimeout { timeout }.build())?
+				.whatever_context("Error reading from connection")?,
+			None => read_payload.await.whatever_context("Error reading from connection")?,
+		};
 		let cotp = Cotp::from_bytes(&buffer)?;
 
 		Ok(Tpkt::from_cotp(cotp))
@@ -987,6 +1007,12 @@ pub enum CotpError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
+	#[snafu(display("Timed out after {timeout:?} reading the rest of a TPKT frame"))]
+	FrameReadTimeout {
+		timeout: Duration,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	#[snafu(whatever, display("{message}{context}\n{source:?}"))]
 	Whatever {
 		message: String,
@@ -1020,6 +1046,7 @@ impl CotpError {
 			CotpError::ReassemblyTooLarge { context, .. } => context,
 			CotpError::CrCcTooLarge { context, .. } => context,
 			CotpError::PeerDisconnected { context, .. } => context,
+			CotpError::FrameReadTimeout { context, .. } => context,
 			CotpError::Whatever { context, .. } => context,
 		}
 	}
@@ -1037,8 +1064,7 @@ enum Connection {
 #[instrument(level = "debug")]
 async fn make_connection(config: &ClientConfig) -> Result<Connection, CotpError> {
 	let stream = tokio::time::timeout(
-		//TODO: Make this configurable
-		Duration::from_secs(10),
+		config.connection.connect_timeout,
 		TcpStream::connect(format!("{}:{}", config.address, config.port)),
 	)
 	.await
@@ -1468,7 +1494,7 @@ mod tests {
 		// and panic; it must now return an error cleanly.
 		let bytes: &[u8] = &[0x03, 0x00, 0x00, 0x03];
 		let mut cursor = bytes;
-		let result = CotpReadHalf::read_tpkt(&mut cursor).await;
+		let result = CotpReadHalf::read_tpkt(&mut cursor, None).await;
 		assert!(matches!(result, Err(CotpError::TpktLengthTooShort { length: 3, .. })));
 	}
 
@@ -1478,8 +1504,44 @@ mod tests {
 		// before attempting the payload allocation.
 		let bytes: &[u8] = &[0x03, 0x00, 0xff, 0xff];
 		let mut cursor = bytes;
-		let result = CotpReadHalf::read_tpkt(&mut cursor).await;
+		let result = CotpReadHalf::read_tpkt(&mut cursor, None).await;
 		assert!(matches!(result, Err(CotpError::TpktLengthTooLarge { length: 0xffff, .. })));
+	}
+
+	#[tokio::test]
+	async fn test_read_tpkt_frame_timeout_on_stalled_payload() {
+		// A valid header promising a 6-byte payload, but the stream then
+		// blocks forever. With a frame timeout set, read_tpkt must give up
+		// with FrameReadTimeout rather than hang.
+		use tokio::io::AsyncRead;
+		// A reader that yields the header then never returns more data.
+		struct HeaderThenStall {
+			header: Vec<u8>,
+			pos: usize,
+		}
+		impl AsyncRead for HeaderThenStall {
+			fn poll_read(
+				mut self: Pin<&mut Self>,
+				_cx: &mut std::task::Context<'_>,
+				buf: &mut tokio::io::ReadBuf<'_>,
+			) -> std::task::Poll<std::io::Result<()>> {
+				if self.pos < self.header.len() {
+					let n = (self.header.len() - self.pos).min(buf.remaining());
+					let end = self.pos + n;
+					buf.put_slice(&self.header[self.pos..end]);
+					self.pos = end;
+					std::task::Poll::Ready(Ok(()))
+				} else {
+					// Stall forever.
+					std::task::Poll::Pending
+				}
+			}
+		}
+
+		// TPKT length 10 => 6-byte payload that never arrives.
+		let mut reader = HeaderThenStall { header: vec![0x03, 0x00, 0x00, 0x0a], pos: 0 };
+		let result = CotpReadHalf::read_tpkt(&mut reader, Some(Duration::from_millis(50))).await;
+		assert!(matches!(result, Err(CotpError::FrameReadTimeout { .. })));
 	}
 
 	#[test]
@@ -1531,7 +1593,7 @@ mod tests {
 		let tpkt = Tpkt::from_cotp(Cotp::Dr(dr));
 		let bytes = tpkt.to_bytes();
 		let mut cursor = &bytes[..];
-		let result = CotpReadHalf::receive_data_from(&mut cursor).await;
+		let result = CotpReadHalf::receive_data_from(&mut cursor, None).await;
 		assert!(matches!(result, Err(CotpError::PeerDisconnected { reason: 0, .. })));
 	}
 
@@ -1620,7 +1682,7 @@ mod tests {
 			buf.resize(buf.len() + payload_len, 0);
 		}
 		let mut cursor = &buf[..];
-		let result = CotpReadHalf::receive_data_from(&mut cursor).await;
+		let result = CotpReadHalf::receive_data_from(&mut cursor, None).await;
 		assert!(matches!(result, Err(CotpError::ReassemblyTooLarge { .. })));
 	}
 

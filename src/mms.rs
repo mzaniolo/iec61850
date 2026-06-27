@@ -73,12 +73,33 @@ pub struct ConnectionConfig {
 	/// before failing with `RequestTimeout`. Set to `None` to wait forever.
 	#[serde(default = "default_request_timeout")]
 	pub request_timeout: Option<Duration>,
+	/// Maximum time to wait for the initial TCP connection to be
+	/// established.
+	#[serde(default = "default_connect_timeout")]
+	pub connect_timeout: Duration,
+	/// Maximum time to wait for the rest of a TPKT frame once its header
+	/// has been received. Bounds a peer that stalls mid-frame without
+	/// affecting idle connections waiting for unsolicited reports (the wait
+	/// for the *next* frame is intentionally unbounded). `None` waits
+	/// forever.
+	#[serde(default = "default_frame_read_timeout")]
+	pub frame_read_timeout: Option<Duration>,
 }
 
 /// Default per-request timeout: 30 seconds. Picked to be long enough for the
 /// slowest reasonable IED while still bounding hangs caused by a peer that
 /// silently drops requests.
 const fn default_request_timeout() -> Option<Duration> {
+	Some(Duration::from_secs(30))
+}
+
+/// Default TCP connect timeout: 10 seconds.
+const fn default_connect_timeout() -> Duration {
+	Duration::from_secs(10)
+}
+
+/// Default mid-frame read timeout: 30 seconds.
+const fn default_frame_read_timeout() -> Option<Duration> {
 	Some(Duration::from_secs(30))
 }
 
@@ -138,6 +159,8 @@ impl Default for ConnectionConfig {
 			data_structure_nesting_level: 10,
 			max_pdu_size: 8192,
 			request_timeout: default_request_timeout(),
+			connect_timeout: default_connect_timeout(),
+			frame_read_timeout: default_frame_read_timeout(),
 		}
 	}
 }
