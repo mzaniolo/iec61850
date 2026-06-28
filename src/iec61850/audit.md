@@ -24,9 +24,9 @@ robustness problems. This repository implements the **client** only.
 |------|----------|------|-------|--------|
 | P0-1 | Critical | `data.rs` | FloatingPoint endianness + format byte wrong | ☑ |
 | P0-2 | Critical | `data.rs` | UtcTime byte order wrong (little-endian) | ☑ |
-| P1-1 | High | `data.rs` | TimeOfDay decode panics on short input | ☐ |
-| P1-2 | High | `data.rs` | Bitstring padding derived from `capacity()` | ☐ |
-| P1-3 | High | `rcb.rs` | RCB field-count discrimination too rigid | ☐ |
+| P1-1 | High | `data.rs` | TimeOfDay decode panics on short input | ☑ |
+| P1-2 | High | `data.rs` | Bitstring padding derived from `capacity()` | ☑ |
+| P1-3 | High | `rcb.rs` | RCB field-count discrimination too rigid | ☑ |
 | P2-1 | Medium | `data.rs` | UtcTime TimeQuality discarded; fraction precision | ☐ |
 | P2-2 | Medium | `report.rs` | Report field order untested against a capture | ☐ |
 | P2-3 | Medium | `iec61850.rs` | `read_dataset` hardcodes `specification_with_result=false` | ☐ |
@@ -98,7 +98,12 @@ real-data test.
 
 ## P1 — Robustness (panics / model-load failures on valid input)
 
-### P1-1 · `data.rs:268-286` · TimeOfDay decode can panic on short input
+### P1-1 · `data.rs:268-286` · TimeOfDay decode can panic on short input  ☑ FIXED
+
+> **Fixed:** the milliseconds field now uses `first_chunk().context(...)?` and
+> the days field uses `get(..).context(...)?`, so a short value errors instead
+> of panicking. Test: `test_time_of_day_short_input_errors_not_panics`.
+
 
 `TryFrom<TimeOfDay> for OffsetDateTime` checks `value.0.len() == 6` only for
 the day part, then unconditionally indexes `value.0[0]..value.0[3]` for the
@@ -110,7 +115,11 @@ bounds-safe; only this path indexes directly.)
 **Fix:** bounds-check with `.get(..).context(MissingData)?` like the UtcTime
 path.
 
-### P1-2 · `data.rs:57-73, 76-84` · Bitstring padding derived from `capacity()`
+### P1-2 · `data.rs:57-73, 76-84` · Bitstring padding derived from `capacity()`  ☑ FIXED
+
+> **Fixed:** padding is now `((8 - len % 8) % 8)` from the logical bit length.
+> Test asserts the padding value in `test_from_bitstring_to_bit_string`.
+
 
 `From<BitString> for Bitstring` computes `padding = value.capacity() -
 value.len()`. `capacity()` is an **allocation** detail, not the logical bit
@@ -125,7 +134,13 @@ write-back paths.
 
 **Fix:** `padding = ((8 - len % 8) % 8) as u8`.
 
-### P1-3 · `rcb.rs:273-287` · RCB field-count discrimination too rigid
+### P1-3 · `rcb.rs:273-287` · RCB field-count discrimination too rigid  ☑ FIXED
+
+> **Fixed:** `from_data` now accepts 14/15 (buffered) and 11/12 (unbuffered);
+> a trailing optional `Owner` attribute is dropped rather than failing the
+> model load. Tests: `test_rcb_parses_without_owner`,
+> `test_rcb_tolerates_trailing_owner`. (Owner is not yet modelled — see note.)
+
 
 `ReportControlBlock::from_data` distinguishes buffered vs unbuffered by exactly
 `len() == 14` / `11`. Real RCBs commonly expose an optional `Owner` attribute

@@ -68,7 +68,11 @@ impl From<BitString> for Bitstring {
 				b
 			})
 			.collect();
-		let padding = (value.capacity() - value.len()) as u8;
+		// Padding is the number of unused bits in the final byte, derived
+		// from the logical bit length. `capacity()` is an allocation detail
+		// and must not be used here (it can yield wrong padding or underflow
+		// the `truncate` on the inverse conversion).
+		let padding = ((8 - value.len() % 8) % 8) as u8;
 		Self { bytes, padding }
 	}
 }
@@ -279,15 +283,20 @@ impl TryFrom<TimeOfDay> for OffsetDateTime {
 
 	#[instrument(level = "debug")]
 	fn try_from(value: TimeOfDay) -> Result<Self, Self::Error> {
-		let mut milliseconds = if value.0.len() == 6 {
-			i64::from(u16::from_be_bytes([value.0[4], value.0[5]])) * MILLISECONDS_PER_DAY
-				+ MMS_TO_UNIX_EPOCH_OFFSET
-		} else {
-			0
-		};
+		// Binary time: 4 octets milliseconds-since-midnight (big-endian),
+		// optionally followed by 2 octets days-since-1984 (big-endian). Use
+		// bounds-checked access so a short/malformed value errors instead of
+		// panicking.
+		let mut milliseconds =
+			i64::from(u32::from_be_bytes(*value.0.first_chunk().context(MissingData)?));
 
-		milliseconds +=
-			i64::from(u32::from_be_bytes([value.0[0], value.0[1], value.0[2], value.0[3]]));
+		if value.0.len() == 6 {
+			let days = u16::from_be_bytes([
+				*value.0.get(4).context(MissingData)?,
+				*value.0.get(5).context(MissingData)?,
+			]);
+			milliseconds += i64::from(days) * MILLISECONDS_PER_DAY + MMS_TO_UNIX_EPOCH_OFFSET;
+		}
 
 		Ok(OffsetDateTime::from_unix_timestamp(milliseconds / 1000).context(InvalidTimestamp)?
 			+ time::Duration::milliseconds(milliseconds % 1000))
@@ -469,8 +478,18 @@ mod tests {
 		let mut bs = BitString::from_slice(&[0x7b, 0x80]);
 		bs.truncate(10);
 		let bitstring: Bitstring = bs.clone().into();
+		// 10 logical bits => 6 bits of padding in the final byte.
+		assert_eq!(bitstring.padding, 6);
 		let bit_string = BitString::from(bitstring);
 		assert_eq!(bs, bit_string);
+	}
+
+	#[test]
+	fn test_time_of_day_short_input_errors_not_panics() {
+		// Fewer than 4 octets must produce an error rather than panic on a
+		// direct index.
+		let short = TimeOfDay([0x00_u8, 0x01].into());
+		assert!(OffsetDateTime::try_from(short).is_err());
 	}
 
 	#[test]

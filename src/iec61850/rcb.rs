@@ -272,16 +272,33 @@ impl UnbufferedReportControlBlock {
 
 impl ReportControlBlock {
 	/// Create a report control block from data.
+	///
+	/// A buffered RCB has 14 mandatory fields and an unbuffered RCB has 11.
+	/// Both may carry a trailing optional `Owner` attribute (15 / 12 fields
+	/// respectively); it is not modelled here, so it is dropped rather than
+	/// failing the whole model load.
 	pub fn from_data(
 		name: String,
-		data: Vec<Iec61850Data>,
+		mut data: Vec<Iec61850Data>,
 	) -> Result<Self, ReportControlBlockError> {
-		if data.len() == 14 {
-			BufferedReportControlBlock::from_data(name, data).map(ReportControlBlock::Buffered)
-		} else if data.len() == 11 {
-			UnbufferedReportControlBlock::from_data(name, data).map(ReportControlBlock::Unbuffered)
-		} else {
-			InvalidDataLength { length: data.len() }.fail()
+		match data.len() {
+			// Buffered, with optional trailing Owner.
+			15 => {
+				data.pop(); // Owner
+				BufferedReportControlBlock::from_data(name, data).map(ReportControlBlock::Buffered)
+			}
+			14 => {
+				BufferedReportControlBlock::from_data(name, data).map(ReportControlBlock::Buffered)
+			}
+			// Unbuffered, with optional trailing Owner.
+			12 => {
+				data.pop(); // Owner
+				UnbufferedReportControlBlock::from_data(name, data)
+					.map(ReportControlBlock::Unbuffered)
+			}
+			11 => UnbufferedReportControlBlock::from_data(name, data)
+				.map(ReportControlBlock::Unbuffered),
+			length => InvalidDataLength { length }.fail(),
 		}
 	}
 }
@@ -440,5 +457,43 @@ mod tests {
 		);
 		let bs: Bitstring = options.into();
 		assert_eq!(bs, data);
+	}
+
+	/// The 11 mandatory fields of an unbuffered RCB, in wire order
+	/// (id .. gi).
+	fn unbuffered_rcb_fields() -> Vec<Iec61850Data> {
+		vec![
+			Iec61850Data::String("rcbID".to_owned()), // id
+			Iec61850Data::Bool(true),                 // enabled
+			Iec61850Data::Bool(false),                // reservation
+			Iec61850Data::String("ds".to_owned()),    // dataset
+			Iec61850Data::Unsigned(1),                // config_rev
+			Iec61850Data::BitString(Bitstring { bytes: vec![0x00, 0x00], padding: 6 }), // opt_flds
+			Iec61850Data::Unsigned(100),              // buffer_time
+			Iec61850Data::Unsigned(0),                // seq_num
+			Iec61850Data::BitString(Bitstring { bytes: vec![0x00], padding: 2 }), // trg_ops
+			Iec61850Data::Unsigned(1000),             // intg_pd
+			Iec61850Data::Bool(false),                // gi
+		]
+	}
+
+	#[test]
+	fn test_rcb_parses_without_owner() {
+		assert!(matches!(
+			ReportControlBlock::from_data("rcb".to_owned(), unbuffered_rcb_fields()),
+			Ok(ReportControlBlock::Unbuffered(_))
+		));
+	}
+
+	#[test]
+	fn test_rcb_tolerates_trailing_owner() {
+		// An extra trailing Owner attribute (12 fields) must still parse as
+		// unbuffered rather than failing with InvalidDataLength.
+		let mut with_owner = unbuffered_rcb_fields();
+		with_owner.push(Iec61850Data::OctetString(vec![1, 2, 3]));
+		assert!(matches!(
+			ReportControlBlock::from_data("rcb".to_owned(), with_owner),
+			Ok(ReportControlBlock::Unbuffered(_))
+		));
 	}
 }
