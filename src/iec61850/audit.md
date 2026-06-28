@@ -22,8 +22,8 @@ robustness problems. This repository implements the **client** only.
 
 | ID | Severity | File | Title | Status |
 |------|----------|------|-------|--------|
-| P0-1 | Critical | `data.rs` | FloatingPoint endianness + format byte wrong | ☐ |
-| P0-2 | Critical | `data.rs` | UtcTime byte order wrong (little-endian) | ☐ |
+| P0-1 | Critical | `data.rs` | FloatingPoint endianness + format byte wrong | ☑ |
+| P0-2 | Critical | `data.rs` | UtcTime byte order wrong (little-endian) | ☑ |
 | P1-1 | High | `data.rs` | TimeOfDay decode panics on short input | ☐ |
 | P1-2 | High | `data.rs` | Bitstring padding derived from `capacity()` | ☐ |
 | P1-3 | High | `rcb.rs` | RCB field-count discrimination too rigid | ☐ |
@@ -40,7 +40,11 @@ robustness problems. This repository implements the **client** only.
 
 ## P0 — Critical correctness (silently wrong values against real IEDs)
 
-### P0-1 · `data.rs:171-184` · FloatingPoint endianness + format byte wrong
+### P0-1 · `data.rs:171-184` · FloatingPoint endianness + format byte wrong  ☑ FIXED
+
+> **Fixed:** decode now `f32::from_be_bytes`; encode writes `[8, be0..be3]`.
+> Real-data tests added (`test_floating_point_big_endian`).
+
 
 MMS `FloatingPoint` is an OCTET STRING whose **first octet is the exponent
 width** (`8` for single precision, `11` for double), followed by the IEEE-754
@@ -64,7 +68,14 @@ real captured value, not just a round-trip.
 
 **Reference:** <https://ask.wireshark.org/question/24687/converting-floating-point-mms/>
 
-### P0-2 · `data.rs:205-227, 246-266` · UtcTime byte order wrong (little-endian)
+### P0-2 · `data.rs:205-227, 246-266` · UtcTime byte order wrong (little-endian)  ☑ FIXED
+
+> **Fixed:** decode/encode now big-endian for seconds and fraction. Also fixed
+> a magnitude bug in the decode (it passed milliseconds-since-epoch to
+> `from_unix_timestamp`, which expects seconds) — now uses
+> `from_unix_timestamp(seconds) + Duration::milliseconds(...)`. Real-data tests
+> added (`test_utc_time_big_endian_decode`, `test_utc_time_big_endian_round_trip`).
+
 
 IEC 61850 `UtcTime` (8 octets) is **big-endian**: 4-octet SecondSinceEpoch,
 3-octet FractionOfSecond, 1-octet TimeQuality.

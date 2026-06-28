@@ -172,14 +172,19 @@ impl TryFrom<FloatingPoint> for f32 {
 	type Error = Iec61850DataError;
 	#[instrument(level = "debug")]
 	fn try_from(value: FloatingPoint) -> Result<Self, Self::Error> {
-		// The first byte is the length of the exponent
-		Ok(f32::from_le_bytes(*value.0.last_chunk().context(InvalidData)?))
+		// MMS FloatingPoint (IEC 9506-2 14.4.2.2) is an OCTET STRING whose
+		// first octet is the exponent width (8 for IEEE single precision)
+		// followed by the value in big-endian IEEE-754. Take the trailing 4
+		// octets (skipping the format byte) and decode big-endian.
+		Ok(f32::from_be_bytes(*value.0.last_chunk().context(InvalidData)?))
 	}
 }
 impl From<f32> for FloatingPoint {
 	fn from(value: f32) -> Self {
-		let bytes = value.to_le_bytes();
-		FloatingPoint(OctetString::from([0, bytes[0], bytes[1], bytes[2], bytes[3]]))
+		// Format byte 8 = number of exponent bits for single precision,
+		// followed by the big-endian IEEE-754 value.
+		let bytes = value.to_be_bytes();
+		FloatingPoint(OctetString::from([8, bytes[0], bytes[1], bytes[2], bytes[3]]))
 	}
 }
 
@@ -207,22 +212,25 @@ impl TryFrom<UtcTime> for OffsetDateTime {
 
 	#[instrument(level = "debug")]
 	fn try_from(value: UtcTime) -> Result<Self, Self::Error> {
-		let seconds = i32::from_le_bytes(*value.0.first_chunk().context(MissingData)?);
-		let milliseconds = i32::from_le_bytes([
+		// IEC 61850 UtcTime (8 octets, big-endian): 4 octets SecondSinceEpoch,
+		// 3 octets FractionOfSecond (value / 2^24 of a second), 1 octet
+		// TimeQuality.
+		let seconds = u32::from_be_bytes(*value.0.first_chunk().context(MissingData)?);
+		let fraction = u32::from_be_bytes([
 			0,
 			*value.0.get(4).context(MissingData)?,
 			*value.0.get(5).context(MissingData)?,
 			*value.0.get(6).context(MissingData)?,
-		]) / 16777;
+		]);
+		// fraction / 2^24 * 1000, as integer milliseconds.
+		let milliseconds = (i64::from(fraction) * 1000) >> 24;
 
-		//TODO: Fix it
-		let quality = value.0.get(7).context(MissingData)?;
-		let _leap_second_known = (quality & 0x80) != 0;
-		let _clock_failure = (quality & 0x40) != 0;
-		let _not_synchronized = (quality & 0x20) != 0;
+		// TODO: surface TimeQuality (leap-second-known, clock-failure,
+		// not-synchronized); for now only validate the octet is present.
+		let _quality = value.0.get(7).context(MissingData)?;
 
-		let timestamp = i64::from(seconds) * 1000 + i64::from(milliseconds);
-		OffsetDateTime::from_unix_timestamp(timestamp).context(InvalidTimestamp)
+		Ok(OffsetDateTime::from_unix_timestamp(i64::from(seconds)).context(InvalidTimestamp)?
+			+ time::Duration::milliseconds(milliseconds))
 	}
 }
 
@@ -245,21 +253,22 @@ impl From<OffsetDateTime> for TimeOfDay {
 
 impl From<OffsetDateTime> for UtcTime {
 	fn from(value: OffsetDateTime) -> Self {
-		let seconds = (value.unix_timestamp() as i32).to_le_bytes();
-		let millisecond = value.millisecond();
-		let seconds_fraction =
-			i32::from((millisecond) * 16777 + ((millisecond * 216) / 1000)).to_le_bytes();
+		// SecondSinceEpoch (big-endian) + FractionOfSecond (big-endian,
+		// millisecond * 2^24 / 1000, 3 octets) + TimeQuality.
+		let seconds = (value.unix_timestamp() as u32).to_be_bytes();
+		let fraction = ((u64::from(value.millisecond()) << 24) / 1000) as u32;
+		let fraction = fraction.to_be_bytes();
 
-		//TODO: Fix it
+		// TODO: encode the real TimeQuality instead of a fixed 0.
 		let quality = 0x00;
 		UtcTime(FixedOctetString::from([
 			seconds[0],
 			seconds[1],
 			seconds[2],
 			seconds[3],
-			seconds_fraction[0],
-			seconds_fraction[1],
-			seconds_fraction[2],
+			fraction[1],
+			fraction[2],
+			fraction[3],
 			quality,
 		]))
 	}
@@ -404,7 +413,7 @@ pub enum Iec61850DataError {
 	InvalidTimestamp { source: time::error::ComponentRange },
 }
 
-#[allow(clippy::unwrap_used, clippy::print_stdout)]
+#[allow(clippy::unwrap_used, clippy::print_stdout, clippy::float_cmp)]
 #[cfg(test)]
 mod tests {
 	use time::format_description::well_known::Rfc3339;
@@ -416,6 +425,44 @@ mod tests {
 		let utc_time = UtcTime(FixedOctetString::from([0, 0, 0, 0, 0, 0, 0, 0]));
 		let offset_date_time = OffsetDateTime::try_from(utc_time).unwrap();
 		assert_eq!(offset_date_time, OffsetDateTime::from_unix_timestamp(0).unwrap());
+	}
+
+	#[test]
+	fn test_utc_time_big_endian_decode() {
+		// 2021-01-01T00:00:00.500Z. SecondSinceEpoch = 1609459200 = 0x5FEE6600
+		// (big-endian); FractionOfSecond for 500 ms = 500*2^24/1000 = 0x800000.
+		let utc_time =
+			UtcTime(FixedOctetString::from([0x5F, 0xEE, 0x66, 0x00, 0x80, 0x00, 0x00, 0x00]));
+		let decoded: OffsetDateTime = utc_time.try_into().unwrap();
+		assert_eq!(decoded, OffsetDateTime::parse("2021-01-01T00:00:00.500Z", &Rfc3339).unwrap());
+	}
+
+	#[test]
+	fn test_utc_time_big_endian_round_trip() {
+		let dt = OffsetDateTime::parse("2021-01-01T00:00:00.500Z", &Rfc3339).unwrap();
+		let utc_time: UtcTime = dt.into();
+		// Encoded form must be big-endian.
+		assert_eq!(utc_time.0.to_vec(), vec![0x5F, 0xEE, 0x66, 0x00, 0x80, 0x00, 0x00, 0x00]);
+		let back: OffsetDateTime = utc_time.try_into().unwrap();
+		assert_eq!(back, dt);
+	}
+
+	#[test]
+	fn test_floating_point_big_endian() {
+		// 1.0_f32 = 0x3F80_0000 (IEEE-754). MMS form prepends the exponent
+		// width byte (8) and stores the value big-endian.
+		let fp = FloatingPoint(OctetString::from(vec![0x08, 0x3F, 0x80, 0x00, 0x00]));
+		let decoded: f32 = fp.try_into().unwrap();
+		assert_eq!(decoded, 1.0);
+
+		let encoded: FloatingPoint = 1.0_f32.into();
+		assert_eq!(encoded.0.to_vec(), vec![0x08, 0x3F, 0x80, 0x00, 0x00]);
+
+		// A second value to guard against accidental symmetry.
+		let encoded: FloatingPoint = (-12.5_f32).into();
+		assert_eq!(encoded.0.to_vec(), vec![0x08, 0xC1, 0x48, 0x00, 0x00]);
+		let decoded: f32 = encoded.try_into().unwrap();
+		assert_eq!(decoded, -12.5);
 	}
 	#[test]
 	fn test_from_bitstring_to_bit_string() {
