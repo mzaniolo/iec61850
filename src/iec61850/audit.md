@@ -27,10 +27,10 @@ robustness problems. This repository implements the **client** only.
 | P1-1 | High | `data.rs` | TimeOfDay decode panics on short input | ☑ |
 | P1-2 | High | `data.rs` | Bitstring padding derived from `capacity()` | ☑ |
 | P1-3 | High | `rcb.rs` | RCB field-count discrimination too rigid | ☑ |
-| P2-1 | Medium | `data.rs` | UtcTime TimeQuality discarded; fraction precision | ☐ |
-| P2-2 | Medium | `report.rs` | Report field order untested against a capture | ☐ |
-| P2-3 | Medium | `iec61850.rs` | `read_dataset` hardcodes `specification_with_result=false` | ☐ |
-| P2-4 | Medium | `iec61850.rs` | `Iec61850ClientError` has no span-trace context | ☐ |
+| P2-1 | Medium | `data.rs` | UtcTime TimeQuality discarded; fraction precision | ☑ |
+| P2-2 | Medium | `report.rs` | Report field order untested against a capture | ☑ |
+| P2-3 | Medium | `iec61850.rs` | `read_dataset` hardcodes `specification_with_result=false` | ☑ |
+| P2-4 | Medium | `iec61850.rs` | `Iec61850ClientError` has no span-trace context | ☑ |
 | P3-1 | Low | `model.rs` | Arrays of structures lose their array-ness | ☐ |
 | P3-2 | Low | `model.rs` | Missing component name becomes empty-string node | ☐ |
 | P3-3 | Low | `model.rs` | `IedModel::Display` swallows serde errors | ☐ |
@@ -155,7 +155,15 @@ the `RP`/`BR` marker plus a minimum length instead of exact equality.
 
 ## P2 — Robustness & completeness
 
-### P2-1 · `data.rs:218-222, 253-254` · TimeQuality discarded; fraction precision
+### P2-1 · `data.rs:218-222, 253-254` · TimeQuality discarded; fraction precision  ☑ FIXED
+
+> **Fixed:** added a `TimeQuality` type (leap-second-known, clock-failure,
+> clock-not-synchronized, time-accuracy) surfaced on
+> `Iec61850Data::UtcTime(OffsetDateTime, TimeQuality)`; encode preserves it via
+> `From<(OffsetDateTime, TimeQuality)> for UtcTime`. The fraction-precision part
+> was already addressed in the P0-2 fix (`* 1000 >> 24` instead of `/ 16777`).
+> Tests: `test_time_quality_byte_round_trip`, `test_utc_time_quality_surfaced`.
+
 
 UtcTime quality bits (leap-second-known, clock-failure, not-synchronized) are
 parsed into `_`-prefixed locals and dropped (`//TODO: Fix it`); encode
@@ -165,20 +173,39 @@ for SCADA — a not-synchronized timestamp should not be trusted silently.
 
 **Fix:** surface quality on the timestamp representation.
 
-### P2-2 · `report.rs:174-213` · Report field order untested against a capture
+### P2-2 · `report.rs:174-213` · Report field order untested against a capture  ☑ FIXED
+
+> **Fixed:** added deterministic parser tests
+> (`test_report_field_order`, `test_report_too_short_is_rejected`) that build an
+> `InformationReport` with a known field layout and assert the mapping. This
+> locks the order logic against regressions; a real-capture test should still be
+> added once a capture is available.
+
 
 The parse order (inclusion → data-references → values → reasons, each sized by
 `meas_count`) looks correct but has **no real-data test**. If the order is
 wrong, every reported value shifts silently. Given P0-1/P0-2 hid in untested
 paths, this warrants a capture-based regression test.
 
-### P2-3 · `iec61850.rs:268` · `read_dataset` hardcodes `specification_with_result=false`
+### P2-3 · `iec61850.rs:268` · `read_dataset` hardcodes `specification_with_result=false`  ☑ DOCUMENTED
+
+> **Resolved (documented):** the vague TODO was replaced with a clear rationale
+> — `false` requests values only and the member order is known from the model;
+> `true` makes the server include the access specification with each result,
+> an encoding the client does not yet parse. Behavior unchanged pending a
+> server-tested implementation.
+
 
 Carries `// TODO: Changing from false to true will break stuff. Investigate
 why.` Positional mapping of results to dataset members is fragile and the TODO
 flags an unresolved correctness question.
 
-### P2-4 · `iec61850.rs:520-543` · `Iec61850ClientError` has no span-trace context
+### P2-4 · `iec61850.rs:520-543` · `Iec61850ClientError` has no span-trace context  ☑ FIXED
+
+> **Fixed:** every variant now carries an implicit `Box<SpanTraceWrapper>` and a
+> `get_context()` accessor was added (mirroring the MMS layer); the
+> `From<MmsClientError>` impl clones the source's context.
+
 
 Unlike every error type in the MMS layer (which carries `SpanTraceWrapper`),
 the IEC 61850 errors carry no context, so failures here lose the diagnostic

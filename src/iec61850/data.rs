@@ -41,8 +41,42 @@ pub enum Iec61850Data {
 	BinaryTime(OffsetDateTime),
 	/// A MMS string.
 	MMSString(String),
-	/// A UTC time.
-	UtcTime(OffsetDateTime),
+	/// A UTC time, with its associated TimeQuality.
+	UtcTime(OffsetDateTime, TimeQuality),
+}
+
+/// The TimeQuality carried in the 8th octet of an IEC 61850 `UtcTime`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimeQuality {
+	/// Whether a leap second is known to the time source.
+	pub leap_second_known: bool,
+	/// Whether the time source has a clock failure.
+	pub clock_failure: bool,
+	/// Whether the clock is not synchronized (the timestamp is not trusted).
+	pub clock_not_synchronized: bool,
+	/// Time accuracy: the number of significant bits of the fraction of a
+	/// second (0..=24; the 5-bit field also encodes "unspecified" values).
+	pub time_accuracy: u8,
+}
+
+impl From<u8> for TimeQuality {
+	fn from(byte: u8) -> Self {
+		Self {
+			leap_second_known: byte & 0x80 != 0,
+			clock_failure: byte & 0x40 != 0,
+			clock_not_synchronized: byte & 0x20 != 0,
+			time_accuracy: byte & 0x1F,
+		}
+	}
+}
+
+impl From<TimeQuality> for u8 {
+	fn from(quality: TimeQuality) -> Self {
+		(u8::from(quality.leap_second_known) << 7)
+			| (u8::from(quality.clock_failure) << 6)
+			| (u8::from(quality.clock_not_synchronized) << 5)
+			| (quality.time_accuracy & 0x1F)
+	}
 }
 
 /// A representation of a bit string.
@@ -129,7 +163,10 @@ impl TryFrom<Data> for Iec61850Data {
 			}
 			Data::binary_time(value) => Iec61850Data::BinaryTime(value.try_into()?),
 			Data::mMSString(value) => Iec61850Data::MMSString(value.into()),
-			Data::utc_time(value) => Iec61850Data::UtcTime(value.try_into()?),
+			Data::utc_time(value) => {
+				let quality = TimeQuality::from(*value.0.get(7).context(MissingData)?);
+				Iec61850Data::UtcTime(value.try_into()?, quality)
+			}
 		})
 	}
 }
@@ -167,7 +204,7 @@ impl TryFrom<Iec61850Data> for Data {
 				VisibleString::from_iso646_bytes(value.as_bytes())
 					.context(InvalidStringConversion)?,
 			)),
-			Iec61850Data::UtcTime(value) => Data::utc_time(value.into()),
+			Iec61850Data::UtcTime(value, quality) => Data::utc_time((value, quality).into()),
 		})
 	}
 }
@@ -257,14 +294,18 @@ impl From<OffsetDateTime> for TimeOfDay {
 
 impl From<OffsetDateTime> for UtcTime {
 	fn from(value: OffsetDateTime) -> Self {
+		(value, TimeQuality::default()).into()
+	}
+}
+
+impl From<(OffsetDateTime, TimeQuality)> for UtcTime {
+	fn from((value, quality): (OffsetDateTime, TimeQuality)) -> Self {
 		// SecondSinceEpoch (big-endian) + FractionOfSecond (big-endian,
 		// millisecond * 2^24 / 1000, 3 octets) + TimeQuality.
 		let seconds = (value.unix_timestamp() as u32).to_be_bytes();
 		let fraction = ((u64::from(value.millisecond()) << 24) / 1000) as u32;
 		let fraction = fraction.to_be_bytes();
 
-		// TODO: encode the real TimeQuality instead of a fixed 0.
-		let quality = 0x00;
 		UtcTime(FixedOctetString::from([
 			seconds[0],
 			seconds[1],
@@ -273,7 +314,7 @@ impl From<OffsetDateTime> for UtcTime {
 			fraction[1],
 			fraction[2],
 			fraction[3],
-			quality,
+			quality.into(),
 		]))
 	}
 }
@@ -398,7 +439,7 @@ impl TryFrom<Iec61850Data> for OffsetDateTime {
 	#[instrument(level = "debug")]
 	fn try_from(value: Iec61850Data) -> Result<Self, Self::Error> {
 		match value {
-			Iec61850Data::UtcTime(value) => Ok(value),
+			Iec61850Data::UtcTime(value, _quality) => Ok(value),
 			Iec61850Data::BinaryTime(value) => Ok(value),
 			_ => Err(Iec61850DataError::InvalidData),
 		}
@@ -454,6 +495,33 @@ mod tests {
 		assert_eq!(utc_time.0.to_vec(), vec![0x5F, 0xEE, 0x66, 0x00, 0x80, 0x00, 0x00, 0x00]);
 		let back: OffsetDateTime = utc_time.try_into().unwrap();
 		assert_eq!(back, dt);
+	}
+
+	#[test]
+	fn test_time_quality_byte_round_trip() {
+		let quality = TimeQuality {
+			leap_second_known: true,
+			clock_failure: false,
+			clock_not_synchronized: true,
+			time_accuracy: 10,
+		};
+		let byte: u8 = quality.into();
+		assert_eq!(byte, 0x80 | 0x20 | 10);
+		assert_eq!(TimeQuality::from(byte), quality);
+	}
+
+	#[test]
+	fn test_utc_time_quality_surfaced() {
+		use crate::mms::ans1::mms::asn1::Data;
+		// Quality octet 0x60 = clock_failure | clock_not_synchronized.
+		let utc = UtcTime(FixedOctetString::from([0x5F, 0xEE, 0x66, 0x00, 0x80, 0x00, 0x00, 0x60]));
+		let data: Iec61850Data = Data::utc_time(utc).try_into().unwrap();
+		let Iec61850Data::UtcTime(_, quality) = data else {
+			panic!("expected UtcTime");
+		};
+		assert!(quality.clock_failure);
+		assert!(quality.clock_not_synchronized);
+		assert!(!quality.leap_second_known);
 	}
 
 	#[test]

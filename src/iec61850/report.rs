@@ -256,3 +256,69 @@ pub enum ReportError {
 		source: Iec61850DataError,
 	},
 }
+
+#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+	use rasn::types::{Integer, VisibleString};
+
+	use super::*;
+	use crate::{
+		iec61850::data::Bitstring,
+		mms::ans1::mms::asn1::{Data, Identifier, ObjectName, VariableAccessSpecification},
+	};
+
+	fn vstr(s: &str) -> VisibleString {
+		VisibleString::from_iso646_bytes(s.as_bytes()).unwrap()
+	}
+
+	/// A report whose OptFlds only sets SequenceNumber must parse the fields
+	/// in the expected order: RptID, OptFlds, [SeqNum], Inclusion, values.
+	/// This locks the field-order logic against regressions.
+	#[test]
+	fn test_report_field_order() {
+		// OptFlds with only the sequence-number bit set.
+		let optflds: Data =
+			Iec61850Data::from(vec![OptionalFields::SequenceNumber]).try_into().unwrap();
+		// Inclusion bitstring with two bits set => two reported values.
+		let inclusion: Data = Iec61850Data::BitString(Bitstring { bytes: vec![0x03], padding: 6 })
+			.try_into()
+			.unwrap();
+
+		let results = vec![
+			AccessResult::success(Data::visible_string(vstr("rcb01"))),
+			AccessResult::success(optflds),
+			AccessResult::success(Data::unsigned(Integer::from(42))),
+			AccessResult::success(inclusion),
+			AccessResult::success(Data::bool(true)),
+			AccessResult::success(Data::bool(false)),
+		];
+
+		// The variable-access-specification is ignored by the parser.
+		let spec = VariableAccessSpecification::variableListName(ObjectName::vmd_specific(
+			Identifier(vstr("x")),
+		));
+		let report = Report::try_from(InformationReport::new(spec, results)).unwrap();
+
+		assert_eq!(report.id, "rcb01");
+		assert_eq!(report.optional_fields, vec![OptionalFields::SequenceNumber]);
+		assert_eq!(report.sequence_number, Some(42));
+		assert_eq!(report.time_of_entry, None);
+		assert_eq!(report.dataset, None);
+		assert_eq!(report.buffer_overflow, None);
+		assert_eq!(report.values, vec![Iec61850Data::Bool(true), Iec61850Data::Bool(false)]);
+		assert!(report.data_reference.is_none());
+		assert!(report.reason_for_transmission.is_none());
+	}
+
+	/// A report with fewer than the minimum (id, optflds, inclusion) fields
+	/// must be rejected.
+	#[test]
+	fn test_report_too_short_is_rejected() {
+		let results = vec![AccessResult::success(Data::visible_string(vstr("rcb01")))];
+		let spec = VariableAccessSpecification::variableListName(ObjectName::vmd_specific(
+			Identifier(vstr("x")),
+		));
+		assert!(Report::try_from(InformationReport::new(spec, results)).is_err());
+	}
+}

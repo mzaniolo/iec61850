@@ -18,7 +18,7 @@ use crate::{
 		rcb::{OptionalFields, ReportControlBlock, ReportControlBlockError, TriggerOptions},
 	},
 	mms::{
-		ClientConfig, MmsObjectClass, ReportCallback,
+		ClientConfig, MmsObjectClass, ReportCallback, SpanTraceWrapper,
 		ans1::mms::asn1::*,
 		client::{MmsClient, MmsClientError},
 	},
@@ -265,7 +265,13 @@ impl Iec61850Client {
 		};
 
 		self.client
-			// TODO: Changing from false to true will break stuff. Investigate why.
+			// `specification_with_result = false` requests the values only; the
+			// dataset member order is already known from the model, so the
+			// positional result-to-member mapping is sufficient. Setting it to
+			// `true` makes the server include the access specification with each
+			// result, an encoding this client does not yet parse — so it is
+			// intentionally fixed to false until that path is implemented and
+			// tested against a real server.
 			.read(VariableAccessSpecification::variableListName(object_name), false)
 			.await?
 			.into_iter()
@@ -523,28 +529,82 @@ impl fmt::Display for ObjectName {
 #[snafu(visibility(pub), context(suffix(false)))]
 pub enum Iec61850ClientError {
 	/// Error converting to visible string.
-	ConvertToVisibleString { source: rasn::error::strings::PermittedAlphabetError },
+	ConvertToVisibleString {
+		source: rasn::error::strings::PermittedAlphabetError,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	/// Invalid variable path format. Expected: <logical_device>/<logical_node>
-	InvalidPath,
+	InvalidPath {
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	/// Error on the MMS client.
-	Client { source: MmsClientError },
+	Client {
+		source: MmsClientError,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	/// Invalid data.
-	InvalidData,
+	InvalidData {
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	/// Invalid data length.
-	InvalidDataLength,
+	InvalidDataLength {
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	/// Error creating report control block.
-	CreateReportControlBlock { source: ReportControlBlockError },
+	CreateReportControlBlock {
+		source: ReportControlBlockError,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	/// Error converting data to MMS data.
-	ConvertDataToMmsData { source: Iec61850DataError },
+	ConvertDataToMmsData {
+		source: Iec61850DataError,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	/// Error creating the IED model.
-	Model { source: model::ModelError },
+	Model {
+		source: model::ModelError,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 	/// Error converting to string
-	ConvertToString { source: Utf8Error },
+	ConvertToString {
+		source: Utf8Error,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
+}
+
+impl Iec61850ClientError {
+	/// Get the span-trace context of the error.
+	#[must_use]
+	pub fn get_context(&self) -> &SpanTraceWrapper {
+		match self {
+			Self::ConvertToVisibleString { context, .. }
+			| Self::InvalidPath { context }
+			| Self::Client { context, .. }
+			| Self::InvalidData { context }
+			| Self::InvalidDataLength { context }
+			| Self::CreateReportControlBlock { context, .. }
+			| Self::ConvertDataToMmsData { context, .. }
+			| Self::Model { context, .. }
+			| Self::ConvertToString { context, .. } => context,
+		}
+	}
 }
 
 impl From<MmsClientError> for Iec61850ClientError {
 	fn from(error: MmsClientError) -> Self {
-		Iec61850ClientError::Client { source: error }
+		Iec61850ClientError::Client {
+			context: Box::new((*error.get_context()).clone()),
+			source: error,
+		}
 	}
 }
 
