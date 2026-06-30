@@ -31,10 +31,10 @@ robustness problems. This repository implements the **client** only.
 | P2-2 | Medium | `report.rs` | Report field order untested against a capture | ☑ |
 | P2-3 | Medium | `iec61850.rs` | `read_dataset` hardcodes `specification_with_result=false` | ☑ |
 | P2-4 | Medium | `iec61850.rs` | `Iec61850ClientError` has no span-trace context | ☑ |
-| P3-1 | Low | `model.rs` | Arrays of structures lose their array-ness | ☐ |
-| P3-2 | Low | `model.rs` | Missing component name becomes empty-string node | ☐ |
-| P3-3 | Low | `model.rs` | `IedModel::Display` swallows serde errors | ☐ |
-| P3-4 | Low | `iec61850.rs` | `set_rcb_dataset` `DatSet` value format unverified | ☐ |
+| P3-1 | Low | `model.rs` | Arrays of structures lose their array-ness | ☑ |
+| P3-2 | Low | `model.rs` | Missing component name becomes empty-string node | ☑ |
+| P3-3 | Low | `model.rs` | `IedModel::Display` swallows serde errors | ☑ |
+| P3-4 | Low | `iec61850.rs` | `set_rcb_dataset` `DatSet` value format unverified | ☑ |
 
 ---
 
@@ -215,26 +215,41 @@ trail the lower layers establish.
 
 ## P3 — Minor
 
-### P3-1 · `model.rs:197-208` · Arrays of structures lose their array-ness
+### P3-1 · `model.rs:197-208` · Arrays of structures lose their array-ness  ☑ FIXED
 
-`Node::to_nodes` only marks scalar element types with `[type]`; an array of
-structures silently becomes a single `DataObject` with the array dimension
+`Node::to_nodes` only marked scalar element types with `[type]`; an array of
+structures silently became a single `DataObject` with the array dimension
 dropped.
 
-### P3-2 · `model.rs:174, 213` · Missing component name becomes empty-string node
+> **Fixed:** added a first-class `Node::Array { count, element }` variant; both
+> scalar and structured arrays now route through it, preserving the dimension
+> and element count. Test: `test_array_of_struct_preserves_array`.
 
-A component with no `component_name` becomes a node named `""` via
+### P3-2 · `model.rs:174, 213` · Missing component name becomes empty-string node  ☑ FIXED
+
+A component with no `component_name` became a node named `""` via
 `unwrap_or_default()` rather than being skipped or reported.
 
-### P3-3 · `model.rs:258-260` · `IedModel::Display` swallows serde errors
+> **Fixed:** both `parse_nodes` and `to_nodes` now skip an unnamed component
+> with a warning. Test: `test_unnamed_component_is_skipped`.
 
-`Display` uses `serde_json::to_string(_pretty)(...).unwrap_or_default()`,
+### P3-3 · `model.rs:258-260` · `IedModel::Display` swallows serde errors  ☑ FIXED
+
+`Display` used `serde_json::to_string(_pretty)(...).unwrap_or_default()`,
 emitting an empty string on a serialization error instead of surfacing it.
 
-### P3-4 · `iec61850.rs:381` · `set_rcb_dataset` `DatSet` value format unverified
+> **Fixed:** a serialization failure now maps to `std::fmt::Error` and is
+> propagated with `?` instead of being swallowed.
+
+### P3-4 · `iec61850.rs:381` · `set_rcb_dataset` `DatSet` value format unverified  ☑ DOCUMENTED
 
 `set_rcb_dataset` strips a leading `@` then writes the value; the exact `DatSet`
 string format expected by servers should be confirmed against a real IED.
+
+> **Resolved (documented):** the method doc now states the expected format —
+> the dataset's MMS object reference in domain-specific form
+> (`LDName/LLN0$DataSetName`), with the `@` association marker stripped.
+> Behavior unchanged; still worth confirming against a real IED.
 
 ---
 

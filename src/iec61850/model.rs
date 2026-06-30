@@ -91,15 +91,17 @@ impl LogicalNode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Node {
-	/// A data attribute.
-	DataAttribute {
-		/// The name of the data attribute.
+	/// An array of `count` elements of the wrapped element node.
+	Array {
+		/// The name of the array.
 		name: String,
-		/// The path of the data attribute.
+		/// The path of the array.
 		#[serde(skip)]
 		path: String,
-		/// The type of the data attribute.
-		r#type: String,
+		/// The number of elements in the array.
+		count: u32,
+		/// The element node type.
+		element: Box<Node>,
 	},
 	/// A data object.
 	DataObject {
@@ -110,6 +112,16 @@ pub enum Node {
 		path: String,
 		/// The nodes in the data object.
 		nodes: Vec<Node>,
+	},
+	/// A data attribute.
+	DataAttribute {
+		/// The name of the data attribute.
+		name: String,
+		/// The path of the data attribute.
+		#[serde(skip)]
+		path: String,
+		/// The type of the data attribute.
+		r#type: String,
 	},
 }
 
@@ -170,8 +182,12 @@ impl LogicalNode {
 		match data_definition {
 			TypeSpecification::structure(structure) => {
 				for component in structure.components.0 {
-					let name =
-						component.component_name.map(|id| id.0.to_string()).unwrap_or_default();
+					// Skip components without a name rather than inventing an
+					// empty-named node.
+					let Some(name) = component.component_name.map(|id| id.0.to_string()) else {
+						tracing::warn!("Logical-node component without a name; skipping");
+						continue;
+					};
 
 					// BR and RP are special nodes that represent report control blocks.
 					if name == "BR" || name == "RP" {
@@ -195,22 +211,25 @@ impl Node {
 	pub fn to_nodes(name: String, path: String, value: TypeSpecification) -> Self {
 		match value {
 			TypeSpecification::array(array) => {
-				let mut node = Self::to_nodes(name, path, array.element_type);
-				match node {
-					Self::DataAttribute { ref mut r#type, .. } => {
-						*r#type = format!("[{}]", r#type);
-					}
-					Self::DataObject { .. } => {
-						tracing::debug!("Found array node. Adding new node...");
-					}
+				// Represent the array explicitly (for both scalar and
+				// structured element types) so the array dimension is not lost.
+				let element = Self::to_nodes(name.clone(), path.clone(), array.element_type);
+				Self::Array {
+					name,
+					path,
+					count: array.number_of_elements.0,
+					element: Box::new(element),
 				}
-				node
 			}
 			TypeSpecification::structure(structure) => {
 				let mut sub_nodes = Vec::new();
 				for component in structure.components.0 {
-					let name =
-						component.component_name.map(|id| id.0.to_string()).unwrap_or_default();
+					// Skip components without a name rather than inventing an
+					// empty-named node.
+					let Some(name) = component.component_name.map(|id| id.0.to_string()) else {
+						tracing::warn!("Structure component without a name; skipping");
+						continue;
+					};
 					let path = format!("{path}${name}");
 
 					let sub_node = Self::to_nodes(name, path, component.component_type);
@@ -254,11 +273,15 @@ impl Node {
 
 impl std::fmt::Display for IedModel {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-		if f.alternate() {
-			write!(f, "{}", serde_json::to_string_pretty(self).unwrap_or_default())
+		// Surface a serialization failure as a fmt error instead of silently
+		// emitting an empty string.
+		let json = if f.alternate() {
+			serde_json::to_string_pretty(self)
 		} else {
-			write!(f, "{}", serde_json::to_string(self).unwrap_or_default())
+			serde_json::to_string(self)
 		}
+		.map_err(|_| std::fmt::Error)?;
+		write!(f, "{json}")
 	}
 }
 
@@ -275,4 +298,66 @@ pub enum ModelError {
 	InvalidDataset { dataset: String },
 	#[snafu(display("Dataset not found: {}", dataset_name))]
 	DatasetNotFound { dataset_name: String },
+}
+
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+	use rasn::types::VisibleString;
+
+	use super::*;
+	use crate::mms::ans1::mms::asn1::{
+		AnonymousTypeSpecificationStructureComponents as Component, Identifier,
+		TypeSpecificationArray, TypeSpecificationStructure, TypeSpecificationStructureComponents,
+		Unsigned32,
+	};
+
+	fn ident(s: &str) -> Identifier {
+		Identifier(VisibleString::from_iso646_bytes(s.as_bytes()).expect("valid"))
+	}
+
+	#[test]
+	fn test_array_of_struct_preserves_array() {
+		// An array of a structure must produce an Array node wrapping a
+		// DataObject, not a bare DataObject (which would drop the dimension).
+		let structure = TypeSpecification::structure(TypeSpecificationStructure {
+			packed: false,
+			components: TypeSpecificationStructureComponents(vec![Component::new(
+				Some(ident("field")),
+				TypeSpecification::bool(()),
+			)]),
+		});
+		let array = TypeSpecification::array(Box::new(TypeSpecificationArray::new(
+			false,
+			Unsigned32(5),
+			structure,
+		)));
+
+		let node = Node::to_nodes("arr".to_owned(), "ld/ln".to_owned(), array);
+		let Node::Array { count, element, .. } = node else {
+			panic!("expected an Array node");
+		};
+		assert_eq!(count, 5);
+		assert!(matches!(*element, Node::DataObject { .. }));
+	}
+
+	#[test]
+	fn test_unnamed_component_is_skipped() {
+		// A structure component without a name must be skipped rather than
+		// producing an empty-named node.
+		let structure = TypeSpecification::structure(TypeSpecificationStructure {
+			packed: false,
+			components: TypeSpecificationStructureComponents(vec![
+				Component::new(None, TypeSpecification::bool(())),
+				Component::new(Some(ident("named")), TypeSpecification::bool(())),
+			]),
+		});
+
+		let node = Node::to_nodes("obj".to_owned(), "ld/ln".to_owned(), structure);
+		let Node::DataObject { nodes, .. } = node else {
+			panic!("expected a DataObject node");
+		};
+		assert_eq!(nodes.len(), 1);
+		assert!(matches!(&nodes[0], Node::DataAttribute { name, .. } if name == "named"));
+	}
 }

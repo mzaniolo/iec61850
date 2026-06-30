@@ -378,6 +378,12 @@ impl Iec61850Client {
 	}
 
 	/// Set the dataset of a report control block.
+	///
+	/// `dataset` is written verbatim to the RCB `DatSet` attribute as a
+	/// VisibleString. Per IEC 61850-8-1 this is the dataset's MMS object
+	/// reference in domain-specific form, e.g. `LDName/LLN0$DataSetName`. A
+	/// leading `@` (this crate's marker for an association-scoped dataset) is
+	/// stripped before sending.
 	#[instrument(skip(self))]
 	pub async fn set_rcb_dataset(
 		&self,
