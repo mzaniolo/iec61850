@@ -1061,6 +1061,7 @@ enum Connection {
 	Tls(TlsStream<TcpStream>),
 }
 
+/// Create a new cotp connection
 #[instrument(level = "debug")]
 async fn make_connection(config: &ClientConfig) -> Result<Connection, CotpError> {
 	let stream = tokio::time::timeout(

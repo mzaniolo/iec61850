@@ -89,14 +89,11 @@ pub enum ServiceFailure {
 	},
 }
 /// The service support options (servicesSupportedCalling), 85 bits.
-/// Byte-for-byte identical to the libiec61850 reference client's proposed
-/// set, which interoperates with IEC 61850-8-1 servers; verified against
-/// libiec61850 v1.5 `mms_client_initiate.c`.
+/// Interoperates with IEC 61850-8-1 servers.
 const SERVICE_SUPPORT_OPTIONS: [u8; 11] =
 	[0xee, 0x1c, 0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x79, 0xef, 0x18];
 /// The parameter support options (parameterCBB), 11 bits. `0xf1` advertises
-/// str1, str2, vnam, vlis and valt — matching the libiec61850 reference
-/// client.
+/// str1, str2, vnam, vlis and valt.
 const PARAMETER_SUPPORT_OPTIONS: [u8; 2] = [0xf1, 0x00];
 
 /// The MMS client.

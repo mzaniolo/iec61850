@@ -83,9 +83,7 @@ impl Session {
 		let response_spdu = Spdu::from_bytes(&response)?;
 		match response_spdu {
 			Spdu::Accept(accept_spdu) => Ok(accept_spdu.data),
-			// Surface the peer's rejection reason instead of a generic
-			// "invalid response" so callers can distinguish a refused
-			// association from a protocol error.
+			// Surface the peer's rejection reason.
 			Spdu::Refuse(refuse) => ConnectionRefused { reason_code: refuse.reason_code }.fail(),
 			Spdu::Abort(_) => ConnectionAborted.fail(),
 			Spdu::Disconnect(_) | Spdu::Finish(_) => ConnectionRefused { reason_code: 0 }.fail(),
@@ -594,8 +592,7 @@ impl ConnectSpdu {
 					}
 					// The Version Number PI is a bitfield: bit 0 (0x01) =
 					// version 1, bit 1 (0x02) = version 2. Accept a peer that
-					// offers either (or both) rather than requiring exactly
-					// version 2 — some servers advertise only version 1.
+					// offers either (or both) — some servers advertise only version 1.
 					let version = *bytes.get(offset).context(NotEnoughBytes)?;
 					if version & 0b11 == 0 {
 						return InvalidVersion { value: version }.fail();

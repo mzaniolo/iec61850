@@ -99,8 +99,7 @@ impl Presentation {
 
 		// If the peer returned a presentation-context-definition-result-list,
 		// verify that the contexts we proposed (ACSE + MMS) were accepted.
-		// A non-zero result means the context was rejected; surface it instead
-		// of pressing on and getting an opaque decoder failure later.
+		// A non-zero result means the context was rejected.
 		if let Some(result_list) = &normal.presentation_context_definition_result_list {
 			for entry in &result_list.0.0 {
 				let result_value: i64 = (&entry.result.0).try_into().unwrap_or(i64::MAX);
@@ -119,8 +118,7 @@ impl Presentation {
 				return UnsupportedUserData.fail();
 			}
 		};
-		// The CPA carries the AARE under the ACSE context. Match on context
-		// id rather than blindly popping the last PDV.
+		// The CPA carries the AARE under the ACSE context. Match on context id.
 		extract_pdv_by_context(pdvs, ACSE_CONTEXT_ID)
 	}
 
@@ -250,10 +248,8 @@ impl PresentationReadHalf {
 				return UnsupportedUserData.fail();
 			}
 		};
-		// Pick the PDV matching the MMS context instead of blindly popping
-		// the last one — peers may legitimately include other PDVs (e.g.
-		// during release exchanges) and silently treating them as MMS data
-		// produces opaque decode errors upstream.
+		// Pick the PDV matching the MMS context. Peers may legitimately include other
+		// PDVs (e.g. during release exchanges).
 		extract_pdv_by_context(pdvs, MMS_CONTEXT_ID)
 	}
 }
