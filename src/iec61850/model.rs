@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt as _, Snafu};
 
-use crate::{iec61850::rcb::ReportControlBlock, mms::ans1::mms::asn1::TypeSpecification};
+use crate::{iec61850::rcb::ReportControlBlock, mms::asn1::mms::asn1::TypeSpecification};
 
 /// A dataset in the IEC61850 ied model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,7 +306,7 @@ mod tests {
 	use rasn::types::VisibleString;
 
 	use super::*;
-	use crate::mms::ans1::mms::asn1::{
+	use crate::mms::asn1::mms::asn1::{
 		AnonymousTypeSpecificationStructureComponents as Component, Identifier,
 		TypeSpecificationArray, TypeSpecificationStructure, TypeSpecificationStructureComponents,
 		Unsigned32,

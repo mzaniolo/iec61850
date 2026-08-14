@@ -19,7 +19,7 @@ use crate::{
 	},
 	mms::{
 		ClientConfig, MmsObjectClass, ReportCallback, SpanTraceWrapper,
-		ans1::mms::asn1::*,
+		asn1::mms::asn1::*,
 		client::{MmsClient, MmsClientError},
 	},
 };

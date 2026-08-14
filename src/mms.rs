@@ -11,7 +11,7 @@ use tracing_error::SpanTrace;
 use crate::iec61850::report::Report;
 
 pub mod acse;
-pub mod ans1;
+pub mod asn1;
 pub mod cotp;
 pub mod presentation;
 pub mod session;

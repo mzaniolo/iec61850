@@ -7,7 +7,7 @@ use tracing::instrument;
 
 use crate::mms::{
 	ClientConfig, ReadHalfConnection, SpanTraceWrapper, WriteHalfConnection,
-	ans1::acse::acse_1::*,
+	asn1::acse::acse_1::*,
 	presentation::{Presentation, PresentationError, PresentationReadHalf, PresentationWriteHalf},
 };
 

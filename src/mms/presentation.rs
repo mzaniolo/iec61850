@@ -8,7 +8,7 @@ use tracing::instrument;
 
 use crate::mms::{
 	ClientConfig, ReadHalfConnection, SpanTraceWrapper, WriteHalfConnection,
-	ans1::presentation::asn1::*,
+	asn1::presentation::asn1::*,
 	session::{Session, SessionError, SessionReadHalf, SessionWriteHalf},
 };
 

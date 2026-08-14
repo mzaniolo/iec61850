@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
 	iec61850::data::{Bitstring, Iec61850DataError},
-	mms::ans1::mms::asn1::{AccessResult, DataAccessError, InformationReport},
+	mms::asn1::mms::asn1::{AccessResult, DataAccessError, InformationReport},
 };
 
 /// A representation of a report.
@@ -265,7 +265,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		iec61850::data::Bitstring,
-		mms::ans1::mms::asn1::{Data, Identifier, ObjectName, VariableAccessSpecification},
+		mms::asn1::mms::asn1::{Data, Identifier, ObjectName, VariableAccessSpecification},
 	};
 
 	fn vstr(s: &str) -> VisibleString {

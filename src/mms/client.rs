@@ -15,7 +15,7 @@ use crate::{
 	mms::{
 		ClientConfig, ReadHalfConnection, ReportCallback, SpanTraceWrapper, WriteHalfConnection,
 		acse::{Acse, AcseError, AcseReadHalf, AcseWriteHalf},
-		ans1::mms::asn1::{self, *},
+		asn1::mms::asn1::{self, *},
 	},
 };
 

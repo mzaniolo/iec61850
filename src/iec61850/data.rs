@@ -9,7 +9,7 @@ use snafu::{OptionExt as _, ResultExt as _, Snafu};
 use time::OffsetDateTime;
 use tracing::instrument;
 
-use crate::mms::ans1::mms::asn1::{Data, FloatingPoint, MMSString, TimeOfDay, UtcTime};
+use crate::mms::asn1::mms::asn1::{Data, FloatingPoint, MMSString, TimeOfDay, UtcTime};
 
 /// The offset between the MMS and the Unix epoch in milliseconds.
 const MMS_TO_UNIX_EPOCH_OFFSET: i64 = 441_763_200_000;
@@ -512,7 +512,7 @@ mod tests {
 
 	#[test]
 	fn test_utc_time_quality_surfaced() {
-		use crate::mms::ans1::mms::asn1::Data;
+		use crate::mms::asn1::mms::asn1::Data;
 		// Quality octet 0x60 = clock_failure | clock_not_synchronized.
 		let utc = UtcTime(FixedOctetString::from([0x5F, 0xEE, 0x66, 0x00, 0x80, 0x00, 0x00, 0x60]));
 		let data: Iec61850Data = Data::utc_time(utc).try_into().unwrap();
