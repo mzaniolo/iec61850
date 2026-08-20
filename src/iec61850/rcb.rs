@@ -301,6 +301,14 @@ impl ReportControlBlock {
 			length => InvalidDataLength { length }.fail(),
 		}
 	}
+	/// Get the dataset of the report control block.
+	#[must_use]
+	pub fn dataset(&self) -> &str {
+		match self {
+			ReportControlBlock::Buffered(buffered) => &buffered.dataset,
+			ReportControlBlock::Unbuffered(unbuffered) => &unbuffered.dataset,
+		}
+	}
 }
 
 /// The error type for the report control block.

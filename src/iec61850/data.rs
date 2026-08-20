@@ -15,6 +15,10 @@ use crate::mms::asn1::mms::asn1::{Data, FloatingPoint, MMSString, TimeOfDay, Utc
 const MMS_TO_UNIX_EPOCH_OFFSET: i64 = 441_763_200_000;
 /// The number of milliseconds in a day.
 const MILLISECONDS_PER_DAY: i64 = 86_400_000;
+/// IEEE-754 binary32 exponent width (MMS FloatingPoint format octet).
+const IEEE754_SINGLE_EXPONENT_WIDTH: u8 = 8;
+/// IEEE-754 binary64 exponent width (MMS FloatingPoint format octet).
+const IEEE754_DOUBLE_EXPONENT_WIDTH: u8 = 11;
 
 /// The IEC61850 data types.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +36,10 @@ pub enum Iec61850Data {
 	/// An unsigned integer value.
 	Unsigned(u32),
 	/// A floating point value.
-	FloatingPoint(f32),
+	///
+	/// MMS may encode IEEE-754 binary32 or binary64; both are stored here as
+	/// `f64`.
+	FloatingPoint(f64),
 	/// An octet string.
 	OctetString(Vec<u8>),
 	/// A visible string.
@@ -209,23 +216,58 @@ impl TryFrom<Iec61850Data> for Data {
 	}
 }
 
-impl TryFrom<FloatingPoint> for f32 {
+impl TryFrom<FloatingPoint> for f64 {
 	type Error = Iec61850DataError;
 	#[instrument(level = "debug")]
 	fn try_from(value: FloatingPoint) -> Result<Self, Self::Error> {
-		// MMS FloatingPoint (IEC 9506-2 14.4.2.2) is an OCTET STRING whose
-		// first octet is the exponent width (8 for IEEE single precision)
-		// followed by the value in big-endian IEEE-754. Take the trailing 4
-		// octets (skipping the format byte) and decode big-endian.
-		Ok(f32::from_be_bytes(*value.0.last_chunk().context(InvalidData)?))
+		// MMS FloatingPoint (IEC 9506-2 14.4.2.2) is an OCTET STRING: the
+		// first octet is the exponent width, the rest is the big-endian
+		// IEEE-754 value. IEC 61850 uses binary32 (width 8) and binary64
+		// (width 11).
+		let bytes = value.0.as_ref();
+		let exponent_width = *bytes.first().context(InvalidData)?;
+		let value_bytes = bytes.get(1..).context(InvalidData)?;
+		match (exponent_width, value_bytes.len()) {
+			(IEEE754_SINGLE_EXPONENT_WIDTH, 4) => {
+				let bits = value_bytes.first_chunk().context(InvalidData)?;
+				Ok(f64::from(f32::from_be_bytes(*bits)))
+			}
+			(IEEE754_DOUBLE_EXPONENT_WIDTH, 8) => {
+				let bits = value_bytes.first_chunk().context(InvalidData)?;
+				Ok(f64::from_be_bytes(*bits))
+			}
+			_ => InvalidData.fail(),
+		}
 	}
 }
+
 impl From<f32> for FloatingPoint {
 	fn from(value: f32) -> Self {
-		// Format byte 8 = number of exponent bits for single precision,
-		// followed by the big-endian IEEE-754 value.
 		let bytes = value.to_be_bytes();
-		FloatingPoint(OctetString::from([8, bytes[0], bytes[1], bytes[2], bytes[3]]))
+		FloatingPoint(OctetString::from([
+			IEEE754_SINGLE_EXPONENT_WIDTH,
+			bytes[0],
+			bytes[1],
+			bytes[2],
+			bytes[3],
+		]))
+	}
+}
+
+impl From<f64> for FloatingPoint {
+	fn from(value: f64) -> Self {
+		// Prefer binary32 when the value is exactly representable as f32 so
+		// FLOAT32 attributes stay FLOAT32 on write. Otherwise emit binary64.
+		#[allow(clippy::cast_possible_truncation)]
+		let as_f32 = value as f32;
+		if f64::from(as_f32).to_bits() == value.to_bits() {
+			return as_f32.into();
+		}
+		let bytes = value.to_be_bytes();
+		let mut encoded = Vec::with_capacity(9);
+		encoded.push(IEEE754_DOUBLE_EXPONENT_WIDTH);
+		encoded.extend_from_slice(&bytes);
+		FloatingPoint(OctetString::from(encoded))
 	}
 }
 
@@ -389,7 +431,7 @@ impl TryFrom<Iec61850Data> for i32 {
 	}
 }
 
-impl TryFrom<Iec61850Data> for f32 {
+impl TryFrom<Iec61850Data> for f64 {
 	type Error = Iec61850DataError;
 	#[instrument(level = "debug")]
 	fn try_from(value: Iec61850Data) -> Result<Self, Self::Error> {
@@ -529,7 +571,7 @@ mod tests {
 		// 1.0_f32 = 0x3F80_0000 (IEEE-754). MMS form prepends the exponent
 		// width byte (8) and stores the value big-endian.
 		let fp = FloatingPoint(OctetString::from(vec![0x08, 0x3F, 0x80, 0x00, 0x00]));
-		let decoded: f32 = fp.try_into().unwrap();
+		let decoded: f64 = fp.try_into().unwrap();
 		assert_eq!(decoded, 1.0);
 
 		let encoded: FloatingPoint = 1.0_f32.into();
@@ -538,8 +580,32 @@ mod tests {
 		// A second value to guard against accidental symmetry.
 		let encoded: FloatingPoint = (-12.5_f32).into();
 		assert_eq!(encoded.0.to_vec(), vec![0x08, 0xC1, 0x48, 0x00, 0x00]);
-		let decoded: f32 = encoded.try_into().unwrap();
+		let decoded: f64 = encoded.try_into().unwrap();
 		assert_eq!(decoded, -12.5);
+	}
+
+	#[test]
+	fn test_floating_point_binary64() {
+		// 1.0_f64 = 0x3FF0_0000_0000_0000. Exponent width 11, 8 value octets.
+		let fp = FloatingPoint(OctetString::from(vec![
+			0x0B, 0x3F, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		]));
+		let decoded: f64 = fp.try_into().unwrap();
+		assert_eq!(decoded, 1.0);
+
+		// A value that is not exactly representable as f32 must stay binary64.
+		let value = 0.1_f64;
+		let encoded: FloatingPoint = value.into();
+		assert_eq!(encoded.0[0], IEEE754_DOUBLE_EXPONENT_WIDTH);
+		assert_eq!(encoded.0.len(), 9);
+		let decoded: f64 = encoded.try_into().unwrap();
+		assert_eq!(decoded, value);
+	}
+
+	#[test]
+	fn test_floating_point_rejects_unknown_width() {
+		let fp = FloatingPoint(OctetString::from(vec![0x07, 0x3F, 0x80, 0x00, 0x00]));
+		assert!(f64::try_from(fp).is_err());
 	}
 	#[test]
 	fn test_from_bitstring_to_bit_string() {
