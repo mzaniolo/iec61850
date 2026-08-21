@@ -4,8 +4,10 @@ use std::{collections::HashMap, fmt, str::Utf8Error};
 
 use rasn::prelude::VisibleString;
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
+use time::OffsetDateTime;
 use tracing::instrument;
 
+pub mod control;
 pub mod data;
 pub mod model;
 pub mod rcb;
@@ -13,6 +15,7 @@ pub mod report;
 
 use crate::{
 	iec61850::{
+		control::ControlOptions,
 		data::{Iec61850Data, Iec61850DataError},
 		model::{IedModel, LogicalDevice, LogicalNode},
 		rcb::{OptionalFields, ReportControlBlock, ReportControlBlockError, TriggerOptions},
@@ -299,6 +302,48 @@ impl Iec61850Client {
 		let list_of_data = vec![data.try_into().context(ConvertDataToMmsData)?];
 
 		self.client.write(variable_access_specification, list_of_data).await.map_err(Into::into)
+	}
+
+	/// Direct-operate: write `{co_reference}$Oper` with a control service structure.
+	///
+	/// `co_reference` is the controllable data object (e.g. `CTRL/CSWI1$CO$Pos`),
+	/// without the `$Oper` / `$SBOw` suffix. `ctl_val` is the CDC-specific
+	/// control value already typed by the caller.
+	#[instrument(skip(self, ctl_val, options))]
+	pub async fn operate(
+		&self,
+		co_reference: &str,
+		ctl_val: Iec61850Data,
+		options: ControlOptions,
+	) -> Result<(), Iec61850ClientError> {
+		let structure = control::build_control_service_structure(
+			ctl_val,
+			&options,
+			OffsetDateTime::now_utc(),
+		);
+		self.set_data_value(&control::oper_path(co_reference).into(), structure).await
+	}
+
+	/// Select-before-operate: write `{co_reference}$SBOw` then `{co_reference}$Oper`
+	/// with the same control service structure.
+	///
+	/// If the Oper write fails after a successful SBOw, the error is returned
+	/// as-is (no Cancel is issued in this API).
+	#[instrument(skip(self, ctl_val, options))]
+	pub async fn select_before_operate(
+		&self,
+		co_reference: &str,
+		ctl_val: Iec61850Data,
+		options: ControlOptions,
+	) -> Result<(), Iec61850ClientError> {
+		let structure = control::build_control_service_structure(
+			ctl_val,
+			&options,
+			OffsetDateTime::now_utc(),
+		);
+		self.set_data_value(&control::sbow_path(co_reference).into(), structure.clone())
+			.await?;
+		self.set_data_value(&control::oper_path(co_reference).into(), structure).await
 	}
 
 	/// Get all the report control blocks in a logical device.
