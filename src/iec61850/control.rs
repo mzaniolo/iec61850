@@ -105,7 +105,8 @@ pub fn build_control_service_structure(
 	])
 }
 
-/// `Check` PACKED LIST: bit0 = synchrocheck, bit1 = interlock-check (2 used bits).
+/// `Check` PACKED LIST: bit0 = synchrocheck, bit1 = interlock-check (2 used
+/// bits).
 fn check_bitstring(synchrocheck: bool, interlock_check: bool) -> Bitstring {
 	let mut bits = 0_u8;
 	if synchrocheck {
@@ -164,10 +165,7 @@ mod tests {
 		assert_eq!(fields[2], Iec61850Data::Unsigned(0));
 		assert!(matches!(fields[3], Iec61850Data::UtcTime(_, _)));
 		assert_eq!(fields[4], Iec61850Data::Bool(true));
-		assert_eq!(
-			fields[5],
-			Iec61850Data::BitString(Bitstring { bytes: vec![0x01], padding: 6 })
-		);
+		assert_eq!(fields[5], Iec61850Data::BitString(Bitstring { bytes: vec![0x01], padding: 6 }));
 	}
 
 	#[test]

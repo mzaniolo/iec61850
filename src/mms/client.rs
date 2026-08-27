@@ -1,6 +1,13 @@
 //! MMS client implementation.
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+	collections::HashMap,
+	fmt,
+	future::Future,
+	pin::Pin,
+	sync::{Arc, RwLock},
+	time::Duration,
+};
 
 use rasn::{ber, prelude::*};
 use snafu::{ResultExt as _, Snafu};
@@ -13,7 +20,8 @@ use tracing::instrument;
 use crate::{
 	iec61850::report::Report,
 	mms::{
-		ClientConfig, ReadHalfConnection, ReportCallback, SpanTraceWrapper, WriteHalfConnection,
+		ClientConfig, DisconnectReason, ReadHalfConnection, SharedClientCallback, SpanTraceWrapper,
+		WriteHalfConnection,
 		acse::{Acse, AcseError, AcseReadHalf, AcseWriteHalf},
 		asn1::mms::asn1::{self, *},
 	},
@@ -54,6 +62,8 @@ enum Command {
 	Shutdown {
 		/// Signaled once the teardown PDU has been written (best-effort).
 		responder: oneshot::Sender<()>,
+		/// Why this association is being torn down locally.
+		reason: DisconnectReason,
 	},
 }
 
@@ -76,8 +86,8 @@ pub enum ServiceFailure {
 	/// The connection to the peer was closed (gracefully or by I/O error)
 	/// while this request was outstanding.
 	ConnectionClosed {
-		/// Human-readable reason captured from the connection-handler loop.
-		reason: String,
+		/// Why the association ended.
+		reason: DisconnectReason,
 	},
 	/// The BER-encoded request exceeds the MMS PDU size negotiated with
 	/// the peer. The caller must split the request and retry.
@@ -96,9 +106,11 @@ const SERVICE_SUPPORT_OPTIONS: [u8; 11] =
 /// str1, str2, vnam, vlis and valt.
 const PARAMETER_SUPPORT_OPTIONS: [u8; 2] = [0xf1, 0x00];
 
-/// The MMS client.
-#[derive(Debug)]
-pub struct MmsClient {
+/// Snapshot of one MMS association. Cheap to clone: a channel sender and an
+/// `Arc` semaphore. Cloned under a brief read lock so requests do not hold
+/// the lock for the duration of a round-trip.
+#[derive(Debug, Clone)]
+struct AssociationHandle {
 	/// Sender used to hand commands (requests, cancels) to the connection
 	/// handler task.
 	tx: mpsc::Sender<Command>,
@@ -113,13 +125,88 @@ pub struct MmsClient {
 	outstanding: Arc<Semaphore>,
 }
 
+impl AssociationHandle {
+	/// Send Conclude-Request and drop this association.
+	async fn close(self, reason: DisconnectReason) -> Result<(), MmsClientError> {
+		let (tx, rx) = oneshot::channel();
+		// If the handler is already gone the connection is effectively
+		// closed, so treat a send failure as success.
+		if self.tx.send(Command::Shutdown { responder: tx, reason }).await.is_err() {
+			return Ok(());
+		}
+		// Best-effort: wait (bounded) for the teardown PDU to be written.
+		match self.request_timeout {
+			Some(timeout) => {
+				let _ = tokio::time::timeout(timeout, rx).await;
+			}
+			None => {
+				let _ = rx.await;
+			}
+		}
+		Ok(())
+	}
+}
+
+/// The MMS client.
+///
+/// The live association is stored behind an `RwLock` so [`Self::reconnect`]
+/// can replace it while other tasks keep using the same client. Each request
+/// clones [`AssociationHandle`] under a short read lock, then uses the
+/// lock-free command channel.
+pub struct MmsClient {
+	/// Current association. Replaced on [`Self::reconnect`].
+	association: RwLock<AssociationHandle>,
+	/// Callback reused when opening a new association.
+	callback: SharedClientCallback,
+}
+
+impl fmt::Debug for MmsClient {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("MmsClient").field("association", &self.association).finish_non_exhaustive()
+	}
+}
+
 impl MmsClient {
 	/// Connect to the MMS server.
 	#[instrument(skip(report_callback))]
 	pub async fn connect(
 		config: &ClientConfig,
-		report_callback: Box<dyn ReportCallback + Send + Sync>,
+		report_callback: SharedClientCallback,
 	) -> Result<Self, MmsClientError> {
+		let association = Self::establish(config, Arc::clone(&report_callback)).await?;
+		Ok(Self { association: RwLock::new(association), callback: report_callback })
+	}
+
+	/// Replace the MMS association.
+	///
+	/// The existing association is left in place if the new connect fails.
+	/// Closing the old association still invokes
+	/// [`crate::ClientCallback::on_disconnected`] with
+	/// [`crate::DisconnectReason::Replaced`] if that association was still
+	/// up. After an unexpected drop the handler is already gone, so this
+	/// close does not produce another callback.
+	///
+	/// Do not call this from [`crate::ClientCallback::on_disconnected`]: that
+	/// runs on the connection-handler task that is tearing down the
+	/// association.
+	#[instrument(skip(self))]
+	pub async fn reconnect(&self, config: &ClientConfig) -> Result<(), MmsClientError> {
+		let new_association = Self::establish(config, Arc::clone(&self.callback)).await?;
+		let old = {
+			let mut guard =
+				self.association.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+			std::mem::replace(&mut *guard, new_association)
+		};
+		let _ = old.close(DisconnectReason::Replaced).await;
+		Ok(())
+	}
+
+	/// Open a new TCP/MMS association and spawn its handler.
+	#[instrument(skip(report_callback))]
+	async fn establish(
+		config: &ClientConfig,
+		report_callback: SharedClientCallback,
+	) -> Result<AssociationHandle, MmsClientError> {
 		let mut acse = Acse::new(config).await?;
 
 		let max_serv_outstanding_called = config.connection.max_serv_outstanding_called;
@@ -192,7 +279,7 @@ impl MmsClient {
 		);
 		tokio::spawn(handler.handle_connection());
 
-		Ok(Self {
+		Ok(AssociationHandle {
 			tx,
 			request_timeout: config.connection.request_timeout,
 			negotiated_max_pdu_size,
@@ -200,12 +287,18 @@ impl MmsClient {
 		})
 	}
 
+	/// Clone of the current association. The `RwLock` is held only for the
+	/// clone.
+	fn association(&self) -> AssociationHandle {
+		self.association.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+	}
+
 	/// Return the MMS PDU size negotiated with the peer. Callers building
 	/// large requests can use this to chunk their payloads (e.g. read/write
 	/// of long variable lists) before invoking `send_request`.
 	#[must_use]
-	pub const fn max_pdu_size(&self) -> usize {
-		self.negotiated_max_pdu_size
+	pub fn max_pdu_size(&self) -> usize {
+		self.association().negotiated_max_pdu_size
 	}
 
 	/// Send a confirmed service request.
@@ -222,15 +315,21 @@ impl MmsClient {
 		&self,
 		request: ConfirmedServiceRequest,
 	) -> Result<ConfirmedServiceResponse, MmsClientError> {
-		let permit =
-			self.outstanding.clone().acquire_owned().await.map_err(|_| ConnectionGone.build())?;
+		let association = self.association();
+		let permit = association
+			.outstanding
+			.clone()
+			.acquire_owned()
+			.await
+			.map_err(|_| ConnectionGone.build())?;
 		let (tx, rx) = oneshot::channel();
-		self.tx
+		association
+			.tx
 			.send(Command::Request { request, responder: tx })
 			.await
 			.map_err(|_| ConnectionGone.build())?;
 
-		let result = match self.request_timeout {
+		let result = match association.request_timeout {
 			Some(timeout) => tokio::time::timeout(timeout, rx)
 				.await
 				.map_err(|_| RequestTimeout { timeout }.build())?,
@@ -599,12 +698,14 @@ impl MmsClient {
 	/// services.
 	#[instrument(skip(self))]
 	pub async fn cancel(&self, original_invoke_id: u32) -> Result<(), MmsClientError> {
+		let association = self.association();
 		let (tx, rx) = oneshot::channel();
-		self.tx
+		association
+			.tx
 			.send(Command::Cancel { original_invoke_id, responder: tx })
 			.await
 			.map_err(|_| ConnectionGone.build())?;
-		let result = match self.request_timeout {
+		let result = match association.request_timeout {
 			Some(timeout) => tokio::time::timeout(timeout, rx)
 				.await
 				.map_err(|_| RequestTimeout { timeout }.build())?,
@@ -626,22 +727,11 @@ impl MmsClient {
 	/// Consumes the client; the connection is unusable afterwards.
 	#[instrument(skip(self))]
 	pub async fn close(self) -> Result<(), MmsClientError> {
-		let (tx, rx) = oneshot::channel();
-		// If the handler is already gone the connection is effectively
-		// closed, so treat a send failure as success.
-		if self.tx.send(Command::Shutdown { responder: tx }).await.is_err() {
-			return Ok(());
-		}
-		// Best-effort: wait (bounded) for the teardown PDU to be written.
-		match self.request_timeout {
-			Some(timeout) => {
-				let _ = tokio::time::timeout(timeout, rx).await;
-			}
-			None => {
-				let _ = rx.await;
-			}
-		}
-		Ok(())
+		self.association
+			.into_inner()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.close(DisconnectReason::Closed)
+			.await
 	}
 }
 
@@ -658,8 +748,8 @@ struct ConnectionHandler {
 	/// Pending cancel requests, keyed by the original invoke id being
 	/// cancelled.
 	cancel_map: HashMap<u32, oneshot::Sender<CancelResult>>,
-	/// The report callback.
-	report_callback: Box<dyn ReportCallback + Send + Sync>,
+	/// Client callback (reports and association lifecycle).
+	report_callback: SharedClientCallback,
 	/// MMS PDU size negotiated with the peer; encoded requests larger than
 	/// this are rejected to the caller with `ServiceFailure::PduTooLarge`
 	/// instead of being sent. Zero means "no limit known".
@@ -673,7 +763,7 @@ impl ConnectionHandler {
 		read_half: AcseReadHalf,
 		write_half: AcseWriteHalf,
 		rx: mpsc::Receiver<Command>,
-		report_callback: Box<dyn ReportCallback + Send + Sync>,
+		report_callback: SharedClientCallback,
 		max_pdu_size: usize,
 	) -> Self {
 		Self {
@@ -722,6 +812,8 @@ impl ConnectionHandler {
 		// Close the request channel so subsequent send_request calls fail
 		// fast rather than hang on the now-orphaned receiver.
 		self.rx.close();
+
+		self.report_callback.on_disconnected(close_reason).await;
 	}
 
 	/// Handle one frame received from the peer. Returns whether the main
@@ -730,9 +822,10 @@ impl ConnectionHandler {
 		let data = match data {
 			Ok(data) => data,
 			Err(e) => {
-				let reason = format!("receive failed: {e}");
-				tracing::error!("{}", reason);
-				return LoopAction::Break(reason);
+				tracing::error!("receive failed: {e}");
+				return LoopAction::Break(DisconnectReason::ReceiveFailed {
+					message: e.to_string(),
+				});
 			}
 		};
 		let response: MMSpdu = match ber::decode(&data).context(DecodeResponse) {
@@ -783,8 +876,8 @@ impl ConnectionHandler {
 			}
 			MMSpdu::initiate_ErrorPDU(response) => {
 				// Fatal: the peer told us the association is broken.
-				let reason = format!("initiate-Error from peer: {:?}", response);
-				tracing::error!("{}", reason);
+				let reason = DisconnectReason::PeerInitiateError;
+				tracing::error!("{reason}: {response:?}");
 				return LoopAction::Break(reason);
 			}
 			MMSpdu::conclude_RequestPDU(_) => {
@@ -797,8 +890,8 @@ impl ConnectionHandler {
 				{
 					tracing::warn!("Error writing conclude-Response: {e}");
 				}
-				let reason = "peer sent conclude-Request".to_owned();
-				tracing::info!("{}", reason);
+				let reason = DisconnectReason::PeerConclude;
+				tracing::info!("{reason}");
 				return LoopAction::Break(reason);
 			}
 			MMSpdu::conclude_ResponsePDU(_) => {
@@ -826,7 +919,7 @@ impl ConnectionHandler {
 			Some(Command::Cancel { original_invoke_id, responder }) => {
 				self.handle_cancel_command(original_invoke_id, responder).await
 			}
-			Some(Command::Shutdown { responder }) => {
+			Some(Command::Shutdown { responder, reason }) => {
 				// Best-effort graceful close: write a Conclude-Request, then
 				// stop the loop so the transport is dropped (TCP FIN).
 				let pdu = MMSpdu::conclude_RequestPDU(ConcludeRequestPDU(()));
@@ -836,9 +929,9 @@ impl ConnectionHandler {
 					tracing::warn!("Error writing conclude-Request during close: {e}");
 				}
 				let _ = responder.send(());
-				LoopAction::Break("local close".to_owned())
+				LoopAction::Break(reason)
 			}
-			None => LoopAction::Break("client dropped".to_owned()),
+			None => LoopAction::Break(DisconnectReason::ClientDropped),
 		}
 	}
 
@@ -855,7 +948,7 @@ impl ConnectionHandler {
 			Err(e) => {
 				tracing::error!("Error preparing request: {:?}", e);
 				let _ = responder.send(Err(ServiceFailure::ConnectionClosed {
-					reason: format!("encode failed: {e}"),
+					reason: DisconnectReason::SendFailed { message: format!("encode failed: {e}") },
 				}));
 				return LoopAction::Continue;
 			}
@@ -868,8 +961,8 @@ impl ConnectionHandler {
 			return LoopAction::Continue;
 		}
 		if let Err(e) = self.write_half.send_data(data).await {
-			let reason = format!("send failed: {e}");
-			tracing::error!("{}", reason);
+			let reason = DisconnectReason::SendFailed { message: e.to_string() };
+			tracing::error!("{reason}");
 			let _ =
 				responder.send(Err(ServiceFailure::ConnectionClosed { reason: reason.clone() }));
 			return LoopAction::Break(reason);
@@ -890,14 +983,14 @@ impl ConnectionHandler {
 			Ok(data) => data,
 			Err(e) => {
 				let _ = responder.send(Err(ServiceFailure::ConnectionClosed {
-					reason: format!("encode failed: {e}"),
+					reason: DisconnectReason::SendFailed { message: format!("encode failed: {e}") },
 				}));
 				return LoopAction::Continue;
 			}
 		};
 		if let Err(e) = self.write_half.send_data(data).await {
-			let reason = format!("send failed: {e}");
-			tracing::error!("{}", reason);
+			let reason = DisconnectReason::SendFailed { message: e.to_string() };
+			tracing::error!("{reason}");
 			let _ =
 				responder.send(Err(ServiceFailure::ConnectionClosed { reason: reason.clone() }));
 			return LoopAction::Break(reason);
@@ -967,10 +1060,9 @@ impl ConnectionHandler {
 enum LoopAction {
 	/// Keep looping.
 	Continue,
-	/// Stop looping with the given human-readable reason; the reason is
-	/// forwarded to every pending waiter so callers can tell why their
-	/// request was abandoned.
-	Break(String),
+	/// Stop looping with the given reason; the reason is forwarded to every
+	/// pending waiter and to [`crate::ClientCallback::on_disconnected`].
+	Break(DisconnectReason),
 }
 
 /// Whether an error is the locally-generated "request PDU exceeds the
@@ -1183,7 +1275,7 @@ mod tests {
 	use rust_telemetry::config::OtelConfig;
 
 	use super::*;
-	use crate::mms::MmsObjectClass;
+	use crate::mms::{ClientCallback, MmsObjectClass};
 
 	#[tokio::test]
 	async fn test_get_logical_devices() -> Result<(), MmsClientError> {
@@ -1191,7 +1283,7 @@ mod tests {
 		if let Err(e) = async {
 			let config = ClientConfig::default();
 			println!("Connecting to server...");
-			let client = MmsClient::connect(&config, Box::new(TestReportCallback)).await?;
+			let client = MmsClient::connect(&config, Arc::new(TestClientCallback)).await?;
 			println!("Getting logical devices...");
 			let devices = client
 				.get_name_list(
@@ -1341,10 +1433,10 @@ mod tests {
 		assert!(matches!(result, Err(MmsClientError::UnexpectedServiceResponse { .. })));
 	}
 
-	struct TestReportCallback;
+	struct TestClientCallback;
 
 	#[async_trait::async_trait]
-	impl ReportCallback for TestReportCallback {
+	impl ClientCallback for TestClientCallback {
 		async fn on_report(&self, report: Report) {
 			tracing::debug!("Report: {:?}", report);
 		}

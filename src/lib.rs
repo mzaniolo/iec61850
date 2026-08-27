@@ -12,4 +12,4 @@
 pub mod iec61850;
 pub mod mms;
 pub use iec61850::Iec61850Client;
-pub use mms::ClientConfig;
+pub use mms::{ClientCallback, ClientConfig, DisconnectReason};

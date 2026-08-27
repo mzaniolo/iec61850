@@ -1,6 +1,11 @@
 //! IEC 61850 client implementation.
 
-use std::{collections::HashMap, fmt, str::Utf8Error};
+use std::{
+	collections::HashMap,
+	fmt,
+	str::Utf8Error,
+	sync::{Arc, RwLock},
+};
 
 use rasn::prelude::VisibleString;
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
@@ -21,46 +26,80 @@ use crate::{
 		rcb::{OptionalFields, ReportControlBlock, ReportControlBlockError, TriggerOptions},
 	},
 	mms::{
-		ClientConfig, MmsObjectClass, ReportCallback, SpanTraceWrapper,
+		ClientCallback, ClientConfig, MmsObjectClass, SharedClientCallback, SpanTraceWrapper,
 		asn1::mms::asn1::*,
 		client::{MmsClient, MmsClientError},
 	},
 };
 
 /// An IEC 61850 client.
-#[derive(Debug)]
 pub struct Iec61850Client {
-	/// The MMS client.
+	/// The MMS client. Association swap lives on [`MmsClient`].
 	client: MmsClient,
 	/// The IEC 61850 model.
-	ied_model: IedModel,
+	ied_model: RwLock<IedModel>,
+	/// Callback reused when opening a new association.
+	callback: SharedClientCallback,
+}
+
+impl fmt::Debug for Iec61850Client {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Iec61850Client")
+			.field("client", &self.client)
+			.field("ied_model", &self.ied_model)
+			.finish_non_exhaustive()
+	}
 }
 
 impl Iec61850Client {
 	/// Create a new IEC 61850 client and load the model from the ied.
 	pub async fn new(
 		config: ClientConfig,
-		report_callback: Box<dyn ReportCallback + Send + Sync>,
+		report_callback: impl ClientCallback + 'static,
 	) -> Result<Self, Iec61850ClientError> {
-		let mut client = Self {
-			client: MmsClient::connect(&config, report_callback).await?,
-			ied_model: IedModel::default(),
+		let callback: SharedClientCallback = Arc::new(report_callback);
+		let client = Self {
+			client: MmsClient::connect(&config, Arc::clone(&callback)).await?,
+			ied_model: RwLock::new(IedModel::default()),
+			callback,
 		};
 		client.reload_ied_model().await?;
+		client.callback.on_connected().await;
 		Ok(client)
 	}
 
-	/// Reload the model from the ied
-	pub async fn reload_ied_model(&mut self) -> Result<(), Iec61850ClientError> {
-		let model = self.get_ied_model().await?;
-		self.ied_model = model;
+	/// Replace the MMS association and reload the IED model.
+	///
+	/// Does **not** re-enable report control blocks or start polling. The
+	/// caller is responsible for applying those after a successful reconnect.
+	///
+	/// The existing association is left in place if the new connect fails.
+	/// Closing the old association still invokes
+	/// [`ClientCallback::on_disconnected`] with
+	/// [`crate::DisconnectReason::Replaced`] if that association was still
+	/// up; a successful reload then invokes
+	/// [`ClientCallback::on_connected`]. Ignore `Replaced` in the
+	/// supervisor instead of tracking extra reconnecting state. Do not call
+	/// this from [`ClientCallback::on_disconnected`]: that runs on the
+	/// connection-handler task that is tearing down the association.
+	pub async fn reconnect(&self, config: &ClientConfig) -> Result<(), Iec61850ClientError> {
+		self.client.reconnect(config).await?;
+		self.reload_ied_model().await?;
+		self.callback.on_connected().await;
 		Ok(())
 	}
 
-	/// Get the IED model.
+	/// Reload the model from the ied
+	pub async fn reload_ied_model(&self) -> Result<(), Iec61850ClientError> {
+		let model = self.get_ied_model().await?;
+		*self.ied_model.write().unwrap_or_else(std::sync::PoisonError::into_inner) = model;
+		Ok(())
+	}
+
+	/// Get a snapshot of the IED model last loaded from the server.
 	#[must_use]
-	pub const fn model(&self) -> &IedModel {
-		&self.ied_model
+	pub fn model(&self) -> IedModel {
+		self.ied_model.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 	}
 
 	/// Get the IED model from the ied.
@@ -304,11 +343,12 @@ impl Iec61850Client {
 		self.client.write(variable_access_specification, list_of_data).await.map_err(Into::into)
 	}
 
-	/// Direct-operate: write `{co_reference}$Oper` with a control service structure.
+	/// Direct-operate: write `{co_reference}$Oper` with a control service
+	/// structure.
 	///
-	/// `co_reference` is the controllable data object (e.g. `CTRL/CSWI1$CO$Pos`),
-	/// without the `$Oper` / `$SBOw` suffix. `ctl_val` is the CDC-specific
-	/// control value already typed by the caller.
+	/// `co_reference` is the controllable data object (e.g.
+	/// `CTRL/CSWI1$CO$Pos`), without the `$Oper` / `$SBOw` suffix. `ctl_val`
+	/// is the CDC-specific control value already typed by the caller.
 	#[instrument(skip(self, ctl_val, options))]
 	pub async fn operate(
 		&self,
@@ -316,16 +356,13 @@ impl Iec61850Client {
 		ctl_val: Iec61850Data,
 		options: ControlOptions,
 	) -> Result<(), Iec61850ClientError> {
-		let structure = control::build_control_service_structure(
-			ctl_val,
-			&options,
-			OffsetDateTime::now_utc(),
-		);
+		let structure =
+			control::build_control_service_structure(ctl_val, &options, OffsetDateTime::now_utc());
 		self.set_data_value(&control::oper_path(co_reference).into(), structure).await
 	}
 
-	/// Select-before-operate: write `{co_reference}$SBOw` then `{co_reference}$Oper`
-	/// with the same control service structure.
+	/// Select-before-operate: write `{co_reference}$SBOw` then
+	/// `{co_reference}$Oper` with the same control service structure.
 	///
 	/// If the Oper write fails after a successful SBOw, the error is returned
 	/// as-is (no Cancel is issued in this API).
@@ -336,13 +373,9 @@ impl Iec61850Client {
 		ctl_val: Iec61850Data,
 		options: ControlOptions,
 	) -> Result<(), Iec61850ClientError> {
-		let structure = control::build_control_service_structure(
-			ctl_val,
-			&options,
-			OffsetDateTime::now_utc(),
-		);
-		self.set_data_value(&control::sbow_path(co_reference).into(), structure.clone())
-			.await?;
+		let structure =
+			control::build_control_service_structure(ctl_val, &options, OffsetDateTime::now_utc());
+		self.set_data_value(&control::sbow_path(co_reference).into(), structure.clone()).await?;
 		self.set_data_value(&control::oper_path(co_reference).into(), structure).await
 	}
 

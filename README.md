@@ -10,15 +10,14 @@ A more complete example of how to use the client can be found on the examples fo
 
 ```rust
 use iec61850::{
- ClientConfig, Iec61850Client,
- mms::ReportCallback,
+ ClientCallback, ClientConfig, Iec61850Client,
 };
 
-/// A test report callback that will print the report to the console.
-struct TestReportCallback;
+/// A test client callback that will print the report to the console.
+struct TestClientCallback;
 
 #[async_trait::async_trait]
-impl ReportCallback for TestReportCallback {
+impl ClientCallback for TestClientCallback {
  async fn on_report(&self, report: Report) {
   println!("Report: {:?}", report);
  }
@@ -28,7 +27,7 @@ impl ReportCallback for TestReportCallback {
 #[tokio::main]
 async fn main() -> Result<(), dyn std::error::Error> {
     // Connects to a server at localhost:102. Configurations like the serve ip and port can be changed using the ClientConfig
-    let client = Iec61850Client::new(ClientConfig::default(), Box::new(TestReportCallback)).await?;
+    let client = Iec61850Client::new(ClientConfig::default(), TestClientCallback).await?;
 
     let model = client.model();
     println!("Ied model: {model:#?}");

@@ -1,6 +1,6 @@
 //! MMS implementation.
 
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use cotp::COTP_MAX_TPDU_SIZE;
@@ -266,9 +266,76 @@ impl TryFrom<u8> for MmsObjectClass {
 	}
 }
 
-/// A trait for reacting to a new report.
+/// Shared handle to a [`ClientCallback`].
+pub type SharedClientCallback = Arc<dyn ClientCallback>;
+
+/// Why an MMS association ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisconnectReason {
+	/// [`crate::mms::client::MmsClient::reconnect`] replaced this still-live
+	/// association with a new one.
+	Replaced,
+	/// This client called [`crate::mms::client::MmsClient::close`].
+	Closed,
+	/// The [`crate::mms::client::MmsClient`] handle was dropped.
+	ClientDropped,
+	/// Reading from the transport failed.
+	ReceiveFailed {
+		/// Display of the underlying I/O or ACSE error.
+		message: String,
+	},
+	/// Writing to the transport failed.
+	SendFailed {
+		/// Display of the underlying I/O or ACSE error.
+		message: String,
+	},
+	/// The peer sent an MMS Conclude-Request.
+	PeerConclude,
+	/// The peer sent an initiate-Error after the association was up.
+	PeerInitiateError,
+}
+
+impl fmt::Display for DisconnectReason {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Replaced => write!(f, "association replaced"),
+			Self::Closed => write!(f, "closed by client"),
+			Self::ClientDropped => write!(f, "client dropped"),
+			Self::ReceiveFailed { message } => write!(f, "receive failed: {message}"),
+			Self::SendFailed { message } => write!(f, "send failed: {message}"),
+			Self::PeerConclude => write!(f, "peer sent conclude-Request"),
+			Self::PeerInitiateError => write!(f, "initiate-Error from peer"),
+		}
+	}
+}
+
+/// Callbacks for IEC 61850 / MMS client events.
+///
+/// Implement [`Self::on_report`] to receive reports. Association lifecycle
+/// methods have debug-log defaults.
 #[async_trait]
-#[allow(missing_docs)]
-pub trait ReportCallback {
+pub trait ClientCallback: Send + Sync {
+	/// A report was received from the server.
 	async fn on_report(&self, report: Report);
+
+	/// The MMS association is up and (for [`crate::Iec61850Client`]) the
+	/// IED model has been loaded.
+	async fn on_connected(&self) {
+		tracing::debug!("Connection started");
+	}
+
+	/// The MMS association ended.
+	///
+	/// Match [`DisconnectReason::Replaced`] (and [`DisconnectReason::Closed`])
+	/// to ignore a teardown this client initiated
+	/// ([`crate::mms::client::MmsClient::reconnect`] /
+	/// [`crate::mms::client::MmsClient::close`]). Other reasons are unexpected
+	/// drops and can drive reconnect from a **separate** task.
+	///
+	/// This is invoked on the connection-handler task. Do **not** call
+	/// [`crate::Iec61850Client::reconnect`] from this method: that would run
+	/// reconnect on the task that is tearing the association down.
+	async fn on_disconnected(&self, reason: DisconnectReason) {
+		tracing::debug!("Connection stopped: {reason}");
+	}
 }
