@@ -16,7 +16,7 @@ use std::{sync::Arc, time::Duration};
 use iec61850::{
 	ClientCallback, ClientConfig, DisconnectReason, Iec61850Client,
 	iec61850::{
-		rcb::{OptionalFields, TriggerOptions},
+		rcb::{BrcbReservation, OptionalFields, ResvTmsDuration, TriggerOptions},
 		report::Report,
 	},
 };
@@ -128,10 +128,20 @@ async fn enable_reports(
 	rcb_path: &str,
 	dataset_path: Option<&str>,
 ) -> Result<(), iec61850::iec61850::Iec61850ClientError> {
+	let path_str = rcb_path;
 	let rcb_path = rcb_path.into();
 
 	let report = client.get_rcb(&rcb_path).await?;
 	tracing::info!("Report control block: {report:#?}");
+
+	client.set_rcb_enabled(&rcb_path, false).await?;
+	if path_str.contains("$BR$") {
+		if let Some(duration) = ResvTmsDuration::from_positive_i16(60) {
+			client.set_rcb_resv_tms(&rcb_path, BrcbReservation::ForTime(duration)).await?;
+		}
+	} else if path_str.contains("$RP$") {
+		client.set_rcb_resv(&rcb_path, true).await?;
+	}
 
 	if let Some(dataset) = dataset_path {
 		client.set_rcb_dataset(&rcb_path, dataset).await?;

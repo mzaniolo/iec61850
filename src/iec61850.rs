@@ -23,7 +23,10 @@ use crate::{
 		control::ControlOptions,
 		data::{Iec61850Data, Iec61850DataError},
 		model::{IedModel, LogicalDevice, LogicalNode},
-		rcb::{OptionalFields, ReportControlBlock, ReportControlBlockError, TriggerOptions},
+		rcb::{
+			BrcbReservation, OptionalFields, ReportControlBlock, ReportControlBlockError,
+			TriggerOptions,
+		},
 	},
 	mms::{
 		ClientCallback, ClientConfig, MmsObjectClass, SharedClientCallback, SpanTraceWrapper,
@@ -455,6 +458,30 @@ impl Iec61850Client {
 		self.set_data_value(&format!("{path}$RptEna").into(), data).await
 	}
 
+	/// Set URCB `Resv` (exclusive reservation for this association).
+	#[instrument(skip(self))]
+	pub async fn set_rcb_resv(
+		&self,
+		path: &ObjectPath,
+		reserved: bool,
+	) -> Result<(), Iec61850ClientError> {
+		path.require_rcb_fc("RP", "Resv")?;
+		let data = Iec61850Data::Bool(reserved);
+		self.set_data_value(&format!("{path}$Resv").into(), data).await
+	}
+
+	/// Set BRCB `ResvTms` ([`BrcbReservation`]).
+	#[instrument(skip(self))]
+	pub async fn set_rcb_resv_tms(
+		&self,
+		path: &ObjectPath,
+		reservation: BrcbReservation,
+	) -> Result<(), Iec61850ClientError> {
+		path.require_rcb_fc("BR", "ResvTms")?;
+		let data = Iec61850Data::Integer(i32::from(reservation.to_resv_tms()));
+		self.set_data_value(&format!("{path}$ResvTms").into(), data).await
+	}
+
 	/// Set the dataset of a report control block.
 	///
 	/// `dataset` is written verbatim to the RCB `DatSet` attribute as a
@@ -663,6 +690,17 @@ pub enum Iec61850ClientError {
 		#[snafu(implicit)]
 		context: Box<SpanTraceWrapper>,
 	},
+	/// Reservation attribute is not defined for this RCB kind.
+	#[snafu(display(
+		"RCB path {path} does not have functional constraint ${expected}; cannot write {attribute}"
+	))]
+	WrongRcbKind {
+		path: String,
+		expected: &'static str,
+		attribute: &'static str,
+		#[snafu(implicit)]
+		context: Box<SpanTraceWrapper>,
+	},
 }
 
 impl Iec61850ClientError {
@@ -678,7 +716,8 @@ impl Iec61850ClientError {
 			| Self::CreateReportControlBlock { context, .. }
 			| Self::ConvertDataToMmsData { context, .. }
 			| Self::Model { context, .. }
-			| Self::ConvertToString { context, .. } => context,
+			| Self::ConvertToString { context, .. }
+			| Self::WrongRcbKind { context, .. } => context,
 		}
 	}
 }
@@ -707,6 +746,31 @@ pub enum ObjectPath {
 }
 
 impl ObjectPath {
+	/// Functional constraint of an IEC 61850-8-1 object reference (`LN$FC$…`).
+	fn functional_constraint(&self) -> Option<&str> {
+		let item = match self {
+			Self::FullPath(path) => path.split_once('/').map_or(path.as_str(), |(_, rest)| rest),
+			Self::FromLogicalDevice { path, .. } => path.as_str(),
+		};
+		let mut parts = item.splitn(3, '$');
+		match (parts.next(), parts.next(), parts.next()) {
+			(Some(_), Some(fc), Some(_)) if !fc.is_empty() => Some(fc),
+			_ => None,
+		}
+	}
+
+	/// Fail unless this path is an RCB with functional constraint `expected`.
+	fn require_rcb_fc(
+		&self,
+		expected: &'static str,
+		attribute: &'static str,
+	) -> Result<(), Iec61850ClientError> {
+		match self.functional_constraint() {
+			Some(fc) if fc == expected => Ok(()),
+			_ => WrongRcbKind { path: self.to_string(), expected, attribute }.fail(),
+		}
+	}
+
 	/// Split a path into a logical device and a logical node.
 	fn get_split_path(&self) -> Result<(&str, &str), Iec61850ClientError> {
 		match self {
@@ -752,5 +816,51 @@ impl fmt::Display for ObjectPath {
 				write!(f, "{}/{}", logical_device, path)
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn require_rcb_fc_accepts_matching_kind() {
+		let urcb: ObjectPath = "simpleIOGenericIO/LLN0$RP$urcb01".into();
+		urcb.require_rcb_fc("RP", "Resv").expect("expected RP kind");
+		let brcb: ObjectPath = ("simpleIOGenericIO", "LLN0$BR$brcb01").into();
+		brcb.require_rcb_fc("BR", "ResvTms").expect("expected BR kind");
+	}
+
+	#[test]
+	fn require_rcb_fc_rejects_wrong_kind() {
+		let urcb: ObjectPath = "simpleIOGenericIO/LLN0$RP$urcb01".into();
+		let err = urcb.require_rcb_fc("BR", "ResvTms").expect_err("expected wrong RCB kind");
+		assert!(matches!(
+			err,
+			Iec61850ClientError::WrongRcbKind { expected: "BR", attribute: "ResvTms", .. }
+		));
+
+		let brcb: ObjectPath = "simpleIOGenericIO/LLN0$BR$brcb01".into();
+		let err = brcb.require_rcb_fc("RP", "Resv").expect_err("expected wrong RCB kind");
+		assert!(matches!(
+			err,
+			Iec61850ClientError::WrongRcbKind { expected: "RP", attribute: "Resv", .. }
+		));
+	}
+
+	#[test]
+	fn require_rcb_fc_rejects_non_rcb_path() {
+		let path: ObjectPath = "simpleIOGenericIO/GGIO1$ST$Ind1".into();
+		assert!(path.require_rcb_fc("RP", "Resv").is_err());
+	}
+
+	#[test]
+	fn functional_constraint_from_object_reference() {
+		let st: ObjectPath = "simpleIOGenericIO/GGIO1$ST$Ind1$stVal".into();
+		assert_eq!(st.functional_constraint(), Some("ST"));
+		let mx: ObjectPath = ("simpleIOGenericIO", "MMXU1$MX$A$phsA$cVal$mag$f").into();
+		assert_eq!(mx.functional_constraint(), Some("MX"));
+		let rcb: ObjectPath = "simpleIOGenericIO/LLN0$BR$brcb01".into();
+		assert_eq!(rcb.functional_constraint(), Some("BR"));
 	}
 }

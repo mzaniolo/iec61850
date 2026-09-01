@@ -1,5 +1,7 @@
 //! IEC61850 report control block.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt as _, ResultExt as _, Snafu};
 use time::OffsetDateTime;
@@ -14,6 +16,75 @@ pub enum ReportControlBlock {
 	/// A unbuffered report control block.
 	Unbuffered(UnbufferedReportControlBlock),
 }
+
+/// Positive BRCB `ResvTms` lifetime in seconds (`1..=i16::MAX`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResvTmsDuration(i16);
+
+impl ResvTmsDuration {
+	/// Accept only values that IEC 61850-8-1 can encode as a positive `INT16`.
+	pub fn new(seconds: u16) -> Result<Self, InvalidBrcbReservation> {
+		match i16::try_from(seconds) {
+			Ok(value) if value > 0 => Ok(Self(value)),
+			_ => Err(InvalidBrcbReservation { seconds }),
+		}
+	}
+
+	/// Seconds to write as `ResvTms`.
+	#[must_use]
+	pub const fn get(self) -> i16 {
+		self.0
+	}
+
+	/// Construct from a positive `INT16` already known to be in range.
+	#[must_use]
+	pub const fn from_positive_i16(seconds: i16) -> Option<Self> {
+		if seconds > 0 { Some(Self(seconds)) } else { None }
+	}
+}
+
+/// BRCB `ResvTms` write (IEC 61850-8-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrcbReservation {
+	/// Reserve for this many seconds (positive `INT16` on the wire).
+	ForTime(ResvTmsDuration),
+	/// `ResvTms = 0` — not reserved / release.
+	Release,
+	/// `ResvTms = -1` — reserved until this association ends.
+	Association,
+}
+
+impl BrcbReservation {
+	/// Timed reservation; fails if `seconds` is not in `1..=i16::MAX`.
+	pub fn for_time(seconds: u16) -> Result<Self, InvalidBrcbReservation> {
+		Ok(Self::ForTime(ResvTmsDuration::new(seconds)?))
+	}
+
+	/// Encode as the BRCB `ResvTms` `INT16` value.
+	#[must_use]
+	pub const fn to_resv_tms(self) -> i16 {
+		match self {
+			Self::Release => 0,
+			Self::Association => -1,
+			Self::ForTime(duration) => duration.get(),
+		}
+	}
+}
+
+/// `ResvTms` duration is not a valid positive `INT16`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidBrcbReservation {
+	/// The value that was rejected.
+	pub seconds: u16,
+}
+
+impl fmt::Display for InvalidBrcbReservation {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "BRCB ResvTms duration {} must be in 1..={}", self.seconds, i16::MAX)
+	}
+}
+
+impl std::error::Error for InvalidBrcbReservation {}
 
 /// A  representation of a buffered report control block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -503,5 +574,14 @@ mod tests {
 			ReportControlBlock::from_data("rcb".to_owned(), with_owner),
 			Ok(ReportControlBlock::Unbuffered(_))
 		));
+	}
+
+	#[test]
+	fn brcb_reservation_encodes_resv_tms() {
+		assert_eq!(BrcbReservation::Release.to_resv_tms(), 0);
+		assert_eq!(BrcbReservation::Association.to_resv_tms(), -1);
+		assert_eq!(BrcbReservation::for_time(60).unwrap().to_resv_tms(), 60);
+		assert!(BrcbReservation::for_time(0).is_err());
+		assert!(BrcbReservation::for_time(u16::MAX).is_err());
 	}
 }
