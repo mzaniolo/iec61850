@@ -11,5 +11,7 @@
 
 pub mod iec61850;
 pub mod mms;
+/// Optional TLS backends (`native_tls` or `rustls` Cargo features).
+mod tls;
 pub use iec61850::Iec61850Client;
 pub use mms::{ClientCallback, ClientConfig, DisconnectReason};

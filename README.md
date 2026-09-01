@@ -8,6 +8,21 @@ This crate provides a client that implements the IEC61850 MMS part of the protoc
 
 A more complete example of how to use the client can be found on the examples folder.
 
+## Cargo features
+
+| Feature | Default | Effect |
+| ------- | ------- | ------ |
+| `native_tls` | no | TLS via **tokio-native-tls** (OpenSSL/system TLS). |
+| `rustls` | no | TLS via **tokio-rustls** (pure Rust, no OpenSSL). Mutually exclusive with `native_tls`. |
+
+By default the crate has **no TLS dependencies** and accepts plain TCP only. If `tls` is set in config without enabling a TLS feature, connection setup returns an error.
+
+```toml
+iec61850 = { version = "0.1", features = ["native_tls"] }
+# or
+iec61850 = { version = "0.1", features = ["rustls"] }
+```
+
 ```rust
 use iec61850::{
  ClientCallback, ClientConfig, Iec61850Client,

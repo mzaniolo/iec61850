@@ -3,20 +3,16 @@
 use std::{pin::Pin, time::Duration};
 
 use async_trait::async_trait;
-use snafu::{OptionExt as _, ResultExt as _, Snafu, whatever};
+#[cfg(not(any(feature = "native_tls", feature = "rustls")))]
+use snafu::whatever;
+use snafu::{OptionExt as _, ResultExt as _, Snafu};
 use tokio::{
 	io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
 	net::TcpStream,
 };
-use tokio_native_tls::{
-	TlsConnector, TlsStream,
-	native_tls::{Certificate, Identity},
-};
 use tracing::instrument;
 
-use crate::mms::{
-	ClientConfig, ReadHalfConnection, SpanTraceWrapper, TlsClientConfig, WriteHalfConnection,
-};
+use crate::mms::{ClientConfig, ReadHalfConnection, SpanTraceWrapper, WriteHalfConnection};
 
 /// The version of the TPKT protocol.
 pub(super) const TPKT_VERSION: u8 = 0x03;
@@ -1058,7 +1054,8 @@ enum Connection {
 	/// The TCP connection.
 	Tcp(TcpStream),
 	/// The TLS connection.
-	Tls(TlsStream<TcpStream>),
+	#[cfg(any(feature = "native_tls", feature = "rustls"))]
+	Tls(Box<crate::tls::TlsStream>),
 }
 
 /// Create a new cotp connection
@@ -1072,60 +1069,25 @@ async fn make_connection(config: &ClientConfig) -> Result<Connection, CotpError>
 	.whatever_context("Connection timeout")?
 	.whatever_context("Error connecting")?;
 
-	Ok(if let Some(ref tls) = config.tls {
-		let connector = make_tls_connector(tls)?;
-		Connection::Tls(
-			connector
-				.connect(&config.address, stream)
-				.await
-				.whatever_context("Error connecting")?,
-		)
-	} else {
-		Connection::Tcp(stream)
-	})
-}
+	match &config.tls {
+		None => Ok(Connection::Tcp(stream)),
+		#[cfg(any(feature = "native_tls", feature = "rustls"))]
+		Some(tls) => {
+			use crate::tls::TlsClientConnector as _;
 
-/// Make a TLS connector.
-#[instrument(level = "debug")]
-fn make_tls_connector(tls: &TlsClientConfig) -> Result<TlsConnector, CotpError> {
-	let root_cert: Option<Certificate> = tls
-		.server_certificate
-		.as_ref()
-		.map(std::fs::read)
-		.transpose()
-		.whatever_context("Failed to read server certificate")?
-		.map(|cert_data| Certificate::from_pem(cert_data.as_slice()))
-		.transpose()
-		.whatever_context("Invalid server certificate")?;
-
-	let identity: Option<Identity> = match (&tls.client_key, &tls.client_certificate) {
-		(Some(client_key), Some(client_cert)) => Some(
-			Identity::from_pkcs8(
-				std::fs::read(client_cert)
-					.whatever_context("Failed to read client certificate")?
-					.as_slice(),
-				std::fs::read(client_key).whatever_context("Failed to read client key")?.as_slice(),
-			)
-			.whatever_context("Could not create client identity")?,
-		),
-		(None, None) => None,
-		_ => whatever!("Both client key *and* certificate must be specified"),
-	};
-
-	let mut connector = tokio_native_tls::native_tls::TlsConnector::builder();
-
-	if let Some(root_cert) = root_cert {
-		connector.add_root_certificate(root_cert);
+			let connector = crate::tls::build_client_connector(tls)?;
+			Ok(Connection::Tls(Box::new(
+				connector
+					.connect(&config.address, stream)
+					.await
+					.whatever_context("Error connecting")?,
+			)))
+		}
+		#[cfg(not(any(feature = "native_tls", feature = "rustls")))]
+		Some(_) => {
+			whatever!("TLS support is disabled; enable the `native_tls` or `rustls` Cargo feature")
+		}
 	}
-
-	if let Some(identity) = identity {
-		connector.identity(identity);
-	}
-
-	connector.danger_accept_invalid_certs(tls.danger_disable_tls_verify);
-
-	let connector = connector.build().whatever_context("Error building TLS connector")?;
-	Ok(TlsConnector::from(connector))
 }
 
 impl AsyncRead for Connection {
@@ -1136,7 +1098,8 @@ impl AsyncRead for Connection {
 	) -> std::task::Poll<std::io::Result<()>> {
 		match self.get_mut() {
 			Connection::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
-			Connection::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+			#[cfg(any(feature = "native_tls", feature = "rustls"))]
+			Connection::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
 		}
 	}
 }
@@ -1149,7 +1112,8 @@ impl AsyncWrite for Connection {
 	) -> std::task::Poll<Result<usize, std::io::Error>> {
 		match self.get_mut() {
 			Connection::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
-			Connection::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+			#[cfg(any(feature = "native_tls", feature = "rustls"))]
+			Connection::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
 		}
 	}
 
@@ -1159,7 +1123,8 @@ impl AsyncWrite for Connection {
 	) -> std::task::Poll<Result<(), std::io::Error>> {
 		match self.get_mut() {
 			Connection::Tcp(stream) => Pin::new(stream).poll_flush(cx),
-			Connection::Tls(stream) => Pin::new(stream).poll_flush(cx),
+			#[cfg(any(feature = "native_tls", feature = "rustls"))]
+			Connection::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
 		}
 	}
 
@@ -1169,7 +1134,8 @@ impl AsyncWrite for Connection {
 	) -> std::task::Poll<Result<(), std::io::Error>> {
 		match self.get_mut() {
 			Connection::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
-			Connection::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+			#[cfg(any(feature = "native_tls", feature = "rustls"))]
+			Connection::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
 		}
 	}
 }
